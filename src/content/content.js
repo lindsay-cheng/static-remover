@@ -111,6 +111,40 @@
     return true;
   }
 
+  // Claim FIRST (before the worklet is built): the only defense against
+  // losing the element to a competing hook is to be earlier. Connects
+  // pass-through so audio never drops. Never called unless the context is
+  // running -- claiming into a suspended context would silence the page.
+  function claimVideo() {
+    const v = findVideo();
+    if (!v) return 'no-video';
+    if (blocked.has(v)) return 'blocked';
+    if (v === currentVideo && currentSource) return null;
+    let s = sources.get(v);
+    if (!s) {
+      try {
+        s = ctx.createMediaElementSource(v); // one-shot per element, forever
+      } catch (e) {
+        blocked.add(v);
+        const reason =
+          (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e));
+        console.warn('[static-remover] cannot hook video:', reason, '| extension:', chrome.runtime.id);
+        return reason || 'unknown';
+      }
+      sources.set(v, s);
+      // Fresh source: route pass-through immediately (never silent). Cached
+      // sources keep whatever routing they already have.
+      try {
+        s.connect(ctx.destination);
+      } catch {
+        return 'connect-failed';
+      }
+    }
+    currentVideo = v;
+    currentSource = s;
+    return null;
+  }
+
   // Returns null on success, a reason string on failure. An element owned by
   // a previous (orphaned) graph can never be re-hooked -- only a tab reload
   // frees it -- so callers must surface the reason, not retry.
@@ -128,13 +162,16 @@
         blocked.add(v);
         const reason =
           (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e));
-        console.warn('[static-remover] cannot hook video:', reason);
+        console.warn('[static-remover] cannot hook video:', reason, '| extension:', chrome.runtime.id);
         return reason || 'unknown';
       }
       sources.set(v, s);
     }
 
     try {
+      // disconnect-first: re-hooking an already-routed source (e.g. after
+      // ad element swaps) must not fan out to two destinations.
+      s.disconnect();
       s.connect(node);
     } catch {
       // Never leave the source unconnected: that would silence the element.
@@ -158,16 +195,23 @@
         sendState();
         return { ok: false, reason: 'needs-gesture', pending: true };
       }
-      await ensureWorklet();
-      const reason = hookVideo();
-      if (reason) {
-        if (reason === 'no-video') {
+      const claimErr = claimVideo();
+      if (claimErr) {
+        if (claimErr === 'no-video') {
           pendingIntent = true;
           sendState();
-          return { ok: false, reason, pending: true };
+          return { ok: false, reason: claimErr, pending: true };
         }
         pendingIntent = false;
-        return { ok: false, reason };
+        return { ok: false, reason: claimErr };
+      }
+      await ensureWorklet();
+      // Swap the pre-connected pass-through onto the worklet node.
+      try {
+        currentSource.disconnect();
+        currentSource.connect(node);
+      } catch {
+        return { ok: false, reason: 'connect-failed' };
       }
       node.port.postMessage({ type: 'enabled', value: true, ...settings });
       enabled = true;

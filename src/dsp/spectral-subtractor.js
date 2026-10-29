@@ -345,11 +345,12 @@ export class SpectralSubtractor {
           }
           const anchored = slowMin[k] * slowMargin;
           // Pin floor: never let the anchor drag N more than ~12 dB below
-          // est. Outlier minima (or a silence-seeded start) would otherwise
-          // pin suppression near passthrough for minutes (measured: ~0 dB
-          // cleaning on a silence-seeded file). Above this bound the anchor
-          // behaves exactly as before.
-          const pinFloor = est[k] / 16;
+          // est at default strength (scales with the slider: divisors below
+          // share the formula). Outlier minima (or a silence-seeded start)
+          // would otherwise pin suppression near passthrough for minutes
+          // (measured: ~0 dB cleaning on a silence-seeded file).
+          const pinDiv = Math.max(2, 16 / (this.maxSuppressionDb / 15));
+          const pinFloor = est[k] / pinDiv;
           const pin = anchored > pinFloor ? anchored : pinFloor;
           noise[k] = (est[k] < pin ? est[k] : pin) * bias;
         }
