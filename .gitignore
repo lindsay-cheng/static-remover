@@ -1,3 +1,15 @@
 node_modules/
 .DS_Store
 *.log
+# Lab artefacts live outside the repo (../audio, ../docs, ../research), but
+# ignore them here too so a stray drop inside the repo can never be committed.
+audio/
+docs/
+research/
+plan*.md
+*.wav
+*.m4a
+*.webm
+*.png
+*.pdf
+.venv/
