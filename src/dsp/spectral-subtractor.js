@@ -60,6 +60,12 @@ export class SpectralSubtractor {
 
     this.gFloor = Math.pow(10, -maxSuppressionDb / 20);
     this.maxSuppressionDb = maxSuppressionDb;
+    // Tonal cap divisor tracks the strength slider QUADRATICALLY: gentle
+    // floors protect partials strictly, aggressive floors genuinely relax
+    // (linear scaling left sustained-coherent passages unaffected, making
+    // the slider a placebo there -- measured: floor 24/30 changed nothing).
+    const sDb = Math.max(1, maxSuppressionDb);
+    this.toneCapDiv = Math.max(1, Math.min(32, Math.round(8 * (15 / sDb) * (15 / sDb))));
     this.maxBin = Math.min(this.bins - 1, Math.round((maxProcessHz * frameSize) / sampleRate));
     // Bark-band index per bin for the masking lift (255 = no band).
     this.binBand = new Uint8Array(this.bins).fill(255);
@@ -159,6 +165,9 @@ export class SpectralSubtractor {
     if (params.maxSuppressionDb !== undefined && Number.isFinite(params.maxSuppressionDb)) {
       const db = Math.max(0, Math.min(40, params.maxSuppressionDb));
       this.gFloor = Math.pow(10, -db / 20);
+      this.maxSuppressionDb = db;
+      const sDb = Math.max(1, db);
+      this.toneCapDiv = Math.max(1, Math.min(32, Math.round(8 * (15 / sDb) * (15 / sDb))));
     }
     if (params.noiseBiasDb !== undefined && Number.isFinite(params.noiseBiasDb)) {
       const db = Math.max(0, Math.min(20, params.noiseBiasDb));
@@ -335,7 +344,14 @@ export class SpectralSubtractor {
             slowMin[k] = m * slowCreep;
           }
           const anchored = slowMin[k] * slowMargin;
-          noise[k] = (est[k] < anchored ? est[k] : anchored) * bias;
+          // Pin floor: never let the anchor drag N more than ~12 dB below
+          // est. Outlier minima (or a silence-seeded start) would otherwise
+          // pin suppression near passthrough for minutes (measured: ~0 dB
+          // cleaning on a silence-seeded file). Above this bound the anchor
+          // behaves exactly as before.
+          const pinFloor = est[k] / 16;
+          const pin = anchored > pinFloor ? anchored : pinFloor;
+          noise[k] = (est[k] < pin ? est[k] : pin) * bias;
         }
       }
       this.framesSeen++;
@@ -356,7 +372,11 @@ export class SpectralSubtractor {
       if (starve[k] > 94) starved++;
     }
     const starvedFrac = starved / (this.maxBin + 1);
-    const liftedFloor = Math.pow(gFloor, 1 - 0.85 * starvedFrac);
+    // Aggressiveness follows the strength slider (1 at default): higher
+    // settings ease less on sustained content (deeper cleaning on demand);
+    // lower settings ease more. Default behavior byte-identical.
+    const aggr = this.maxSuppressionDb / 15;
+    const liftedFloor = Math.pow(gFloor, Math.max(0, 1 - (0.85 * starvedFrac) / aggr));
     // Spectral smoothing of the noise estimate (libspecbleach): our noise[]
     // is the only un-smoothed quantity feeding the MMSE gain, and single-bin
     // floor spikes become single-bin gain wells (sparkle). 3-tap box blended
@@ -366,7 +386,6 @@ export class SpectralSubtractor {
       noiseS[k] = 0.5 * noise[k] + 0.5 * ((noise[k - 1] + noise[k] + noise[k + 1]) / 3);
     }
     noiseS[bins - 1] = 0.5 * noise[bins - 1] + 0.5 * ((noise[bins - 2] + noise[bins - 1]) / 2);
-    const maxSuppDb = this.maxSuppressionDb;
     const gain = this.gain;
     const bypass = this.bypass;
     const gateT = this.tonalityGate;
@@ -391,16 +410,17 @@ export class SpectralSubtractor {
         cleanPow[k] = power[k];
         continue;
       }
-      // Tonal cap: a coherent bin is a sustained partial, so its SNR is at
-      // least +9 dB -- cap the assumed noise at 1/8 of observed power.
-      // Estimates may legitimately hold tone energy (seeding); without the
-      // cap they would crush partials and fading tails. Failure mode is
-      // safe: a hiss bin misread as tonal is only mildly under-suppressed
-      // for a frame, never passed through (an exact bypass let white-noise
-      // spikes through and collapsed the noise cut).
+      // Tonal cap: a coherent bin is a sustained partial. Cap the assumed
+      // noise at observed power / toneCapDiv (default /8 = +9 dB SNR floor).
+      // Scales with the strength slider (gentle floors protect strictly,
+      // aggressive floors cut deeper on explicit user request). Estimates
+      // may legitimately hold tone energy (seeding); without the cap they
+      // would crush partials and fading tails. Failure mode is safe: a hiss
+      // bin misread as tonal is only mildly under-suppressed for a frame,
+      // never passed through.
       let n = noiseS[k] + 1e-20;
       if (coherence[k] >= gateT) {
-        const cap = power[k] * 0.125 + 1e-20;
+        const cap = power[k] / this.toneCapDiv + 1e-20;
         if (n > cap) n = cap;
       }
 
@@ -435,7 +455,8 @@ export class SpectralSubtractor {
         const s = bandP[b] - bandN[b];
         const snr = 10 * Math.log10((s > 0 ? s : 0) / (bandN[b] + 1e-20) + 1e-20);
         const lift = 0.5 * (snr - 18);
-        bandLift[b] = lift < 0 ? 0 : lift > 8 ? 8 : lift;
+        const liftCap = 8 / aggr;
+        bandLift[b] = lift < 0 ? 0 : lift > liftCap ? liftCap : lift;
       }
       let prev = bandLift[0];
       for (let b = 0; b < 23; b++) {
