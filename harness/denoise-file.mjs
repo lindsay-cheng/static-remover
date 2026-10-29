@@ -32,6 +32,9 @@ const optionFlags = {
   'max-suppression-db': 'maxSuppressionDb',
   'noise-bias-db': 'noiseBiasDb',
   'noise-rise-sec': 'noiseRiseSec',
+  'suppression-knee-db': 'suppressionKneeDb',
+  'slow-rise-sec': 'slowRiseSec',
+  'slow-margin': 'slowMargin',
   'tonality-gate': 'tonalityGate',
   'warmup-sec': 'warmupSec',
 };

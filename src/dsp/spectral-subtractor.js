@@ -42,6 +42,9 @@ export class SpectralSubtractor {
       maxSuppressionDb = 15,
       noiseBiasDb = 9,
       noiseRiseSec = 8,
+      suppressionKneeDb = 12,
+      slowRiseSec = 600,
+      slowMargin = 1.5,
       warmupSec = 0.5,
       smoothBeta = 0.75,
       maxProcessHz = 16000,
@@ -59,6 +62,8 @@ export class SpectralSubtractor {
     this.bins = (frameSize >> 1) + 1;
 
     this.gFloor = Math.pow(10, -maxSuppressionDb / 20);
+    this.maxSuppressionDb = maxSuppressionDb;
+    this.suppressionKneeDb = suppressionKneeDb;
     this.noiseBias = Math.pow(10, noiseBiasDb / 20);
     this.beta = smoothBeta;
     this.oneMinusBeta = 1 - smoothBeta;
@@ -72,6 +77,10 @@ export class SpectralSubtractor {
     const framesPerSec = sampleRate / hopSize;
     this.estFall = 0.1;
     this.estRise = 1 / (noiseRiseSec * framesPerSec);
+    // Slow anchor creep: doubling per slowRiseSec (minute-scale), so even
+    // minutes of continuous tutti can only drag the anchor up ~1-2 dB.
+    this.slowCreep = Math.pow(2, 1 / (slowRiseSec * framesPerSec));
+    this.slowMargin = slowMargin;
     this.warmupFrames = Math.round(warmupSec * framesPerSec);
     this.framesSeen = 0;
 
@@ -96,6 +105,7 @@ export class SpectralSubtractor {
     this.power = new Float32Array(this.bins);
     this.smoothed = new Float32Array(this.bins);
     this.est = new Float32Array(this.bins);
+    this.slowMin = new Float32Array(this.bins);
     this.noise = new Float32Array(this.bins);
     this.prevRe = new Float32Array(this.bins);
     this.prevIm = new Float32Array(this.bins);
@@ -153,7 +163,7 @@ export class SpectralSubtractor {
   processFrame() {
     const {
       N, H, bins, window, frameRe, frameIm, smoothed, power,
-      est, noise, prevRe, prevIm, crossRe, crossIm, magProd, coherence,
+      est, slowMin, noise, prevRe, prevIm, crossRe, crossIm, magProd, coherence,
       pSmooth, cleanPow,
     } = this;
 
@@ -196,6 +206,8 @@ export class SpectralSubtractor {
       if (this.framesSeen >= this.warmupFrames) {
         const fall = this.estFall;
         const rise = this.estRise;
+        const slowCreep = this.slowCreep;
+        const slowMargin = this.slowMargin;
         const bias = this.noiseBias;
         const gate = this.tonalityGate;
         for (let k = 0; k < bins; k++) {
@@ -203,7 +215,23 @@ export class SpectralSubtractor {
             const s = smoothed[k];
             const e = est[k];
             est[k] = e === 0 ? s : e + (s - e) * (s < e ? fall : rise);
-            noise[k] = est[k] * bias;
+            // Slow global-minimum anchor: the fast envelope latches onto
+            // dense music (its minima are music, not hiss); the slow minimum
+            // remembers the true floor from quieter moments. Pin the estimate
+            // near it. Creep is minute-scale so extended tutti can only drag
+            // it up ~1-2 dB; genuine floor rises are under-tracked, which is
+            // the safe direction. Initialized from the first frames, so
+            // toggling mid-fortissimo starts hot and converges as dips arrive.
+            const m = slowMin[k];
+            if (m === 0) {
+              slowMin[k] = s;
+            } else if (s < m) {
+              slowMin[k] = s;
+            } else {
+              slowMin[k] = m * slowCreep;
+            }
+            const anchored = slowMin[k] * slowMargin;
+            noise[k] = (est[k] < anchored ? est[k] : anchored) * bias;
           }
         }
       }
@@ -214,9 +242,30 @@ export class SpectralSubtractor {
     // a priori SNR (eq. 51, alpha 0.98). The DD recursion is the temporal
     // smoother, so there is no gain-domain smoothing at all. Bypass forces
     // unity gain (bit-exact delay line, same latency) for toggle-off.
-    const gFloor = this.gFloor;
+    //
+    // Loudness-aware ceiling: in loud frames the music masks the hiss, so
+    // deep suppression buys nothing and risks everything (this was round-2's
+    // "power of the orchestra is gone"). The allowed suppression per frame
+    // ramps from full maxSuppressionDb in quiet frames down to 0 dB
+    // (passthrough) once the frame's wideband SNR exceeds the knee.
     const gain = this.gain;
     const bypass = this.bypass;
+    let frameFloor = this.gFloor;
+    if (!bypass) {
+      let sigPow = 0;
+      let noisePow = 0;
+      for (let k = 0; k <= this.maxBin; k++) {
+        sigPow += smoothed[k];
+        noisePow += noise[k];
+      }
+      const snrWb = 10 * Math.log10(sigPow / (noisePow + 1e-20) + 1e-20);
+      const maxSuppDb = this.maxSuppressionDb;
+      const allowedDb = Math.max(
+        0,
+        Math.min(maxSuppDb, maxSuppDb - Math.max(0, snrWb - this.suppressionKneeDb)),
+      );
+      frameFloor = Math.pow(10, -allowedDb / 20);
+    }
     const DD_ALPHA = 0.98;
     const XI_MIN = 0.0031622776601683794; // -25 dB
     const XI_MAX = 1000;
@@ -237,7 +286,7 @@ export class SpectralSubtractor {
       if (xi < XI_MIN) xi = XI_MIN;
       else if (xi > XI_MAX) xi = XI_MAX;
 
-      gain[k] = stsGain(xi, gamma, gFloor);
+      gain[k] = stsGain(xi, gamma, frameFloor);
       cleanPow[k] = gain[k] * gain[k] * power[k];
     }
     gain[0] = 1;
