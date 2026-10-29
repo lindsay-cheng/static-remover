@@ -1,0 +1,11 @@
+{
+  "name": "static-remover",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Real-time static/noise removal for YouTube audio. Chrome MV3 extension sharing one DSP core with the offline harness.",
+  "scripts": {
+    "denoise": "node harness/denoise-file.mjs",
+    "samples": "bash harness/run-samples.sh"
+  }
+}
