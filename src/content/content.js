@@ -28,6 +28,11 @@
   const blocked = new WeakSet(); // elements that must never be touched again
   let gestureArmed = false;
   let busy = false;
+  // pendingIntent: the user asked for ON but it isn't yet (player not
+  // mounted, no page gesture yet, enable still working). Distinct from
+  // failure: the badge shows "…" and the observer retries automatically.
+  let pendingIntent = false;
+  let lastAttempt = 0;
 
   function findVideo() {
     return (
@@ -38,7 +43,9 @@
   }
 
   function sendState() {
-    chrome.runtime.sendMessage({ type: 'state', enabled }).catch(() => {});
+    chrome.runtime
+      .sendMessage({ type: 'state', enabled, pending: pendingIntent })
+      .catch(() => {});
   }
 
   chrome.storage.sync.get(DEFAULTS, (v) => {
@@ -139,22 +146,34 @@
   }
 
   async function enable() {
-    if (busy) return { ok: false, reason: 'busy' };
+    if (busy) return { ok: true, pending: true };
     busy = true;
     try {
       if (!(await ensureContext())) {
         armGesture();
-        return { ok: false, reason: 'needs-gesture' };
+        pendingIntent = true;
+        sendState();
+        return { ok: false, reason: 'needs-gesture', pending: true };
       }
       await ensureWorklet();
       const reason = hookVideo();
-      if (reason) return { ok: false, reason };
+      if (reason) {
+        if (reason === 'no-video') {
+          pendingIntent = true;
+          sendState();
+          return { ok: false, reason, pending: true };
+        }
+        pendingIntent = false;
+        return { ok: false, reason };
+      }
       node.port.postMessage({ type: 'enabled', value: true, ...settings });
       enabled = true;
+      pendingIntent = false;
       sendState();
       return { ok: true };
     } catch (e) {
       console.warn('[static-remover] enable failed:', e);
+      pendingIntent = false;
       return { ok: false, reason: String((e && e.message) || e) };
     } finally {
       busy = false;
@@ -164,6 +183,7 @@
   function disable() {
     if (node) node.port.postMessage({ type: 'enabled', value: false });
     enabled = false;
+    pendingIntent = false;
     sendState();
     return true;
   }
@@ -190,12 +210,12 @@
     if (msg?.type !== 'toggle') return;
     if (enabled) {
       disable();
-      reply({ enabled, ok: true });
+      reply({ enabled, ok: true, pending: false });
       return;
     }
     enable()
-      .then((r) => reply({ enabled, ok: r.ok, error: r.reason }))
-      .catch((e) => reply({ enabled, ok: false, error: String(e) }));
+      .then((r) => reply({ enabled, ok: r.ok, error: r.reason, pending: !!r.pending }))
+      .catch((e) => reply({ enabled, ok: false, error: String(e), pending: false }));
     return true; // async reply
   });
 
@@ -206,6 +226,19 @@
     scheduled = true;
     requestAnimationFrame(() => {
       scheduled = false;
+      if (pendingIntent && !enabled && !busy) {
+        // A pending toggle retries on player mutations (mount, SPA nav),
+        // throttled; success clears it via enable(). Failures stay silent
+        // here -- the badge already shows pending.
+        const now = Date.now();
+        if (now - lastAttempt > 2000) {
+          lastAttempt = now;
+          enable().then((r) => {
+            if (r.ok) pendingIntent = false;
+          });
+        }
+        return;
+      }
       if (!enabled || !ctx || !node) return;
       if (currentVideo && !currentVideo.isConnected) {
         currentVideo = null;

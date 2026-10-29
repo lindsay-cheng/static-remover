@@ -10,6 +10,21 @@ async function setBadge(tabId, enabled) {
   }
 }
 
+const PENDING_TITLES = {
+  'no-video': 'Player not ready — switches on automatically when it loads',
+  'needs-gesture': 'Click the video once — cleaning starts by itself',
+  busy: 'Working…',
+};
+
+async function setPendingBadge(tabId, reason) {
+  await chrome.action.setBadgeText({ tabId, text: '…' });
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: '#808080' });
+  await chrome.action.setTitle({
+    tabId,
+    title: `Static Remover: ${PENDING_TITLES[reason] || 'will switch on automatically'}`,
+  });
+}
+
 async function showProblem(tabId, reason) {
   await chrome.action.setBadgeText({ tabId, text: '?' });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#cc0000' });
@@ -41,6 +56,10 @@ async function toggle(tab) {
   if (!tab?.id) return;
   try {
     const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
+    if (res?.pending) {
+      await setPendingBadge(tab.id, res?.error);
+      return;
+    }
     if (res?.ok === false) {
       console.warn('[static-remover] toggle failed:', res?.error);
       await showProblem(tab.id, res?.error);
@@ -52,6 +71,10 @@ async function toggle(tab) {
     if (await ensureContentScript(tab.id, tab.url)) {
       try {
         const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
+        if (res?.pending) {
+          await setPendingBadge(tab.id, res?.error);
+          return;
+        }
         if (res?.ok === false) {
           await showProblem(tab.id, res?.error);
           return;
@@ -60,7 +83,11 @@ async function toggle(tab) {
         return;
       } catch {}
     }
-    await showProblem(tab.id);
+    if (/^https:\/\/(www\.)?youtube\.com\//.test(tab.url || '')) {
+      await showProblem(tab.id, 'tab still loading — click again in a moment');
+    } else {
+      await showProblem(tab.id, 'open a YouTube video first');
+    }
   }
 }
 
@@ -76,6 +103,10 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg?.type === 'state' && sender.tab?.id != null) {
-    setBadge(sender.tab.id, !!msg.enabled);
+    if (msg.pending && !msg.enabled) {
+      setPendingBadge(sender.tab.id);
+    } else {
+      setBadge(sender.tab.id, !!msg.enabled);
+    }
   }
 });

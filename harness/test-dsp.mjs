@@ -218,5 +218,77 @@ function check(label, ok, detail) {
   check('HF harmonics survive noise + processing (muffle >= -1.5 dB)', muffle >= -1.5, `muffle ${muffle.toFixed(2)} dB`);
 }
 
+// 6. Sharp attacks survive (no smearing): strikes with 2 ms attacks + hiss.
+//    Attack time (10-90% of local peak) must not stretch, peaks must hold.
+//    Uniform noise is bounded well below the 10% threshold by construction,
+//    so the measurement cannot trigger on hiss.
+function measureAttack(x, startIdx) {
+  const end = Math.min(x.length, startIdx + Math.floor(0.1 * sr));
+  let peak = 0;
+  let pi = startIdx;
+  for (let i = startIdx; i < end; i++) {
+    const a = Math.abs(x[i]);
+    if (a > peak) {
+      peak = a;
+      pi = i;
+    }
+  }
+  const lo = Math.max(0, pi - Math.floor(0.05 * sr));
+  let t10 = pi;
+  let t90 = pi;
+  for (let i = lo; i <= pi; i++) {
+    if (Math.abs(x[i]) >= 0.1 * peak) {
+      t10 = i;
+      break;
+    }
+  }
+  for (let i = lo; i <= pi; i++) {
+    if (Math.abs(x[i]) >= 0.9 * peak) {
+      t90 = i;
+      break;
+    }
+  }
+  return {
+    attackMs: ((t90 - t10) / sr) * 1000,
+    peakDb: 20 * Math.log10(peak + 1e-20),
+  };
+}
+
+{
+  const n = sr * 6;
+  const sig = new Float32Array(n);
+  const strike = (start, f) => {
+    for (let i = 0; i < n; i++) {
+      const t = i / sr - start;
+      if (t < 0 || t > 1.5) continue;
+      const a = Math.min(1, t / 0.002);
+      const env = a * a * Math.exp(-3 * t);
+      sig[i] +=
+        0.5 *
+        env *
+        (Math.sin(2 * Math.PI * f * t) +
+          0.4 * Math.sin(2 * Math.PI * 2 * f * t) +
+          0.2 * Math.sin(2 * Math.PI * 3 * f * t));
+    }
+  };
+  strike(1, 440);
+  strike(2.5, 554);
+  strike(4, 659);
+  for (let i = 0; i < n; i++) sig[i] += 0.03 * (rand() * 2 - 1);
+  const out = run(sig, opts);
+  let worstStretch = 0;
+  let worstPeak = 0;
+  const detail = [];
+  for (const start of [1, 2.5, 4]) {
+    const m = measureAttack(sig, Math.floor(start * sr));
+    const o = measureAttack(out, Math.floor(start * sr));
+    worstStretch = Math.max(worstStretch, o.attackMs - m.attackMs);
+    worstPeak = Math.min(worstPeak, o.peakDb - m.peakDb);
+    detail.push(`${start}s: ${(o.attackMs - m.attackMs).toFixed(1)}ms/${(o.peakDb - m.peakDb).toFixed(2)}dB`);
+  }
+  check('attacks not smeared (stretch <= +10 ms)', worstStretch <= 10, detail.join(' '));
+  check('attack peaks hold (>= -1 dB)', worstPeak >= -1, detail.join(' '));
+}
+
 console.log(failures === 0 ? 'all checks passed' : `${failures} check(s) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
