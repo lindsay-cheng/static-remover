@@ -33,7 +33,7 @@ if (!ProcessorClass) {
   process.exit(1);
 }
 
-const proc = new ProcessorClass({ processorOptions: { frameSize: FRAME, alpha: 2 } });
+const proc = new ProcessorClass({ processorOptions: { frameSize: FRAME } });
 const send = (m) => proc.port.onmessage({ data: m });
 
 function stereo(seconds, fill) {
@@ -110,7 +110,7 @@ function check(label, ok, detail) {
     l[i] = 0.03 * (Math.random() * 2 - 1);
     r[i] = 0.03 * (Math.random() * 2 - 1);
   });
-  send({ type: 'enabled', value: true, alpha: 2, maxSuppressionDb: 18, noiseBiasDb: 9 });
+  send({ type: 'enabled', value: true, maxSuppressionDb: 18, noiseBiasDb: 9 });
   const [oL, oR] = runThrough([L, R]);
   const from = sr * 5;
   const dropL = bandDb(L, from, L.length, 600, 1400) - bandDb(oL, from, oL.length, 600, 1400);
@@ -134,7 +134,7 @@ function check(label, ok, detail) {
 // 4. Disable returns to exact passthrough; config clamps garbage.
 {
   send({ type: 'enabled', value: false });
-  send({ type: 'config', alpha: -3, maxSuppressionDb: 999, noiseBiasDb: NaN });
+  send({ type: 'config', maxSuppressionDb: 999, noiseBiasDb: NaN });
   const [L] = stereo(3, (i, l) => {
     l[i] = 0.4 * Math.sin((2 * Math.PI * 440 * i) / sr);
   });
@@ -144,8 +144,7 @@ function check(label, ok, detail) {
   for (let i = sr; i < L.length; i++) {
     maxErr = Math.max(maxErr, Math.abs(oL[i] - L[i - FRAME]));
   }
-  const alphaOk = proc.channels.every((c) => c.alpha === 0);
-  check('disable + garbage config = exact passthrough', maxErr < 1e-4 && alphaOk, `err ${maxErr.toExponential(2)}, alpha 0: ${alphaOk}`);
+  check('disable + garbage config = exact passthrough', maxErr < 1e-4 && proc.enabled === false, `err ${maxErr.toExponential(2)}, enabled: ${proc.enabled}`);
 }
 
 console.log(failures === 0 ? 'all worklet checks passed' : `${failures} check(s) FAILED`);

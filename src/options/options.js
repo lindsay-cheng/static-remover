@@ -1,20 +1,16 @@
 // Plain options page: native controls, persisted to chrome.storage.sync,
 // picked up live by the content script. Debounced writes (sync quota).
 
-const DEFAULTS = { alpha: 1.0, maxSuppressionDb: 12 };
-const alpha = document.getElementById('alpha');
+const DEFAULTS = { maxSuppressionDb: 15 };
 const floor = document.getElementById('floor');
-const alphaOut = document.getElementById('alphaOut');
 const floorOut = document.getElementById('floorOut');
 
 function render() {
-  alphaOut.value = Number(alpha.value).toFixed(1);
   floorOut.value = `${floor.value} dB`;
 }
 
 async function init() {
   const s = await chrome.storage.sync.get(DEFAULTS);
-  alpha.value = s.alpha;
   floor.value = s.maxSuppressionDb;
   render();
 
@@ -30,13 +26,9 @@ function save() {
   render();
   clearTimeout(timer);
   timer = setTimeout(() => {
-    chrome.storage.sync.set({
-      alpha: Number(alpha.value),
-      maxSuppressionDb: Number(floor.value),
-    });
+    chrome.storage.sync.set({ maxSuppressionDb: Number(floor.value) });
   }, 200);
 }
 
-alpha.addEventListener('input', save);
 floor.addEventListener('input', save);
 init();

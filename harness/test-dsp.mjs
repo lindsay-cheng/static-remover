@@ -1,11 +1,11 @@
 // Pass/fail checks for the DSP core. If any of these fail, stop and say so.
 //
-//   node harness/test-dsp.mjs [--alpha N] [--noise-bias-db N] [--max-suppression-db N]
+//   node harness/test-dsp.mjs [--noise-bias-db N] [--max-suppression-db N]
 //
 // run() returns the cleaned signal time-aligned with the input (the pipeline's
 // frameSize latency is trimmed), so comparisons are sample-exact.
 
-import { SpectralSubtractor } from '../src/dsp/spectral-subtractor.js';
+import { SpectralSubtractor, stsGain } from '../src/dsp/spectral-subtractor.js';
 
 const flags = new Map();
 const argv = process.argv.slice(2);
@@ -16,7 +16,7 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 const opts = {};
-for (const key of ['alpha', 'noiseBiasDb', 'maxSuppressionDb', 'noiseRiseSec']) {
+for (const key of ['noiseBiasDb', 'maxSuppressionDb', 'noiseRiseSec']) {
   const flag = key.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
   if (flags.has(flag)) opts[key] = flags.get(flag);
 }
@@ -24,8 +24,9 @@ for (const key of ['alpha', 'noiseBiasDb', 'maxSuppressionDb', 'noiseRiseSec']) 
 const sr = 48000;
 const latency = 2048;
 
-function run(sig, options) {
+function run(sig, options, bypassed = false) {
   const sub = new SpectralSubtractor({ sampleRate: sr, ...options });
+  if (bypassed) sub.setBypassed(true);
   const stream = new Float32Array(sig.length + latency);
   for (let off = 0; off < sig.length; off += 1024) {
     const n = Math.min(1024, sig.length - off);
@@ -66,25 +67,57 @@ function bandDb(x, from, to, f0, f1) {
   return 10 * Math.log10(energy + 1e-20);
 }
 
+// Piano-like note: fundamental + 12 harmonics (1/h^1.5 falloff, faster decay
+// up top), so the spectrum has real high-frequency content like the recording.
+function pianoNote(t, start, f) {
+  const dt = t - start;
+  if (dt < 0) return 0;
+  let v = 0;
+  for (let h = 1; h <= 12; h++) {
+    v +=
+      (0.5 / Math.pow(h, 1.5)) *
+      Math.exp(-2.2 * dt * (1 + 0.25 * (h - 1))) *
+      Math.sin(2 * Math.PI * f * h * dt);
+  }
+  return v;
+}
 let failures = 0;
 function check(label, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}  (${detail})`);
   if (!ok) failures++;
 }
 
-// 1. Perfect reconstruction when alpha = 0 (after the stream-start ramp).
+// 0. STSA gain matches published reference values (Ephraim-Malah eq. 13).
+{
+  const cases = [
+    [1.0, 1, 0.7743],
+    [0.5, 1, 0.5936],
+    [0.1, 0.2, 0.6029],
+    [10, 10, 0.9345],
+    // nu = 100*100/101 > 50, so the Wiener asymptote xi/(1+xi) applies
+    // (exact to 0.043 dB per Ephraim-Malah; here 0.022 dB).
+    [100, 100, 100 / 101],
+  ];
+  let maxErr = 0;
+  for (const [xi, gamma, expected] of cases) {
+    maxErr = Math.max(maxErr, Math.abs(stsGain(xi, gamma) - expected));
+  }
+  check('STSA gain matches reference values', maxErr < 1e-3, `max abs err ${maxErr.toExponential(2)}`);
+}
+
+// 1. Perfect reconstruction when bypassed (after the stream-start ramp).
 {
   const n = sr * 2;
   const sig = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     sig[i] = 0.5 * Math.sin(2 * Math.PI * 440 * i / sr) + 0.25 * Math.sin(2 * Math.PI * 3000 * i / sr);
   }
-  const out = run(sig, { alpha: 0 });
+  const out = run(sig, {}, true);
   let maxErr = 0;
   for (let i = latency; i < n; i++) {
     maxErr = Math.max(maxErr, Math.abs(out[i] - sig[i]));
   }
-  check('alpha=0 reconstructs the signal exactly', maxErr < 1e-4, `max abs err ${maxErr.toExponential(2)}`);
+  check('bypass reconstructs the signal exactly', maxErr < 1e-4, `max abs err ${maxErr.toExponential(2)}`);
 }
 
 // 2. A 30 s sustained tone must survive. (The old windowed-min estimator ate it.)
@@ -110,7 +143,7 @@ function check(label, ok, detail) {
   const sig = new Float32Array(n);
   for (let i = 0; i < n; i++) sig[i] = 0.03 * (Math.random() * 2 - 1);
   const outDefault = run(sig, opts);
-  const outStrong = run(sig, { alpha: 2, noiseBiasDb: 9, maxSuppressionDb: 18 });
+  const outStrong = run(sig, { maxSuppressionDb: 18 });
   const before = bandDb(sig, sr * 5, n, 600, 1400);
   const afterDefault = bandDb(outDefault, sr * 5, n, 600, 1400);
   const afterStrong = bandDb(outStrong, sr * 5, n, 600, 1400);
@@ -133,16 +166,41 @@ function check(label, ok, detail) {
   const sig = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const t = i / sr;
-    const note = (start, f) => {
-      const dt = t - start;
-      return dt < 0 ? 0 : 0.5 * Math.exp(-2.2 * dt) * Math.sin(2 * Math.PI * f * dt);
-    };
-    sig[i] = note(3, 440) + note(3.5, 554) + note(4, 659) + 0.03 * (Math.random() * 2 - 1);
+    sig[i] =
+      pianoNote(t, 3, 440) +
+      pianoNote(t, 3.5, 554) +
+      pianoNote(t, 4, 659) +
+      0.03 * (Math.random() * 2 - 1);
   }
   const out = run(sig, opts);
   const before = rms(sig, sr * 3.05, sr * 5);
   const after = rms(out, sr * 3.05, sr * 5);
   check('decaying notes keep their level', after - before > -1, `${(after - before).toFixed(2)} dB change`);
+}
+
+// 5. Sustained HF-rich complex + noise vs the same complex clean: the
+//    harmonics must survive (tests the tonality gate + STSA where the
+//    reference band is genuinely music-dominated).
+{
+  const n = sr * 12;
+  const ref = new Float32Array(n);
+  const sig = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    let music = 0;
+    for (let h = 1; h <= 6; h++) {
+      music += (0.3 / h) * Math.sin(2 * Math.PI * 2000 * h * t);
+    }
+    ref[i] = music;
+    sig[i] = music + 0.03 * (Math.random() * 2 - 1);
+  }
+  const out = run(sig, opts);
+  const from = sr * 5;
+  const to = n;
+  const dAll = rms(out, from, to) - rms(ref, from, to);
+  const dHi = bandDb(out, from, to, 4000, 13000) - bandDb(ref, from, to, 4000, 13000);
+  const muffle = dHi - dAll;
+  check('HF harmonics survive noise + processing (muffle >= -1.5 dB)', muffle >= -1.5, `muffle ${muffle.toFixed(2)} dB`);
 }
 
 console.log(failures === 0 ? 'all checks passed' : `${failures} check(s) FAILED`);

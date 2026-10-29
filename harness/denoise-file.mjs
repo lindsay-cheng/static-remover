@@ -24,12 +24,11 @@ for (let i = 0; i < args.length; i++) {
 
 const [inPath, outPath] = positional;
 if (!inPath || !outPath) {
-  console.error('usage: node harness/denoise-file.mjs <in.wav> <out.wav> [--alpha N] [--max-suppression-db N]');
+  console.error('usage: node harness/denoise-file.mjs <in.wav> <out.wav> [--max-suppression-db N] [--noise-bias-db N] ...');
   process.exit(1);
 }
 
 const optionFlags = {
-  alpha: 'alpha',
   'max-suppression-db': 'maxSuppressionDb',
   'noise-bias-db': 'noiseBiasDb',
   'noise-rise-sec': 'noiseRiseSec',
@@ -71,8 +70,7 @@ for (const input of wav.channels) {
 await writeBytes(outPath, encodeWavPcm16(wav.sampleRate, outChannels));
 console.log(
   `denoised ${inPath} -> ${outPath} ` +
-    `(${wav.frames} frames, ${wav.sampleRate} Hz, alpha=${params.alpha}, ` +
-    `maxSupp=${(20 * Math.log10(params.gFloor)).toFixed(1)} dB, latency=${frameSize} samples)`,
+    `(${wav.frames} frames, ${wav.sampleRate} Hz, floor=${(20 * Math.log10(params.gFloor)).toFixed(1)} dB, latency=${frameSize} samples)`,
 );
 
 async function readBytes(path) {

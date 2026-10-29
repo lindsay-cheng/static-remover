@@ -8,7 +8,7 @@
   if (globalThis.__staticRemover) return;
   globalThis.__staticRemover = true;
 
-  const DEFAULTS = { alpha: 1.0, maxSuppressionDb: 12, noiseBiasDb: 3 };
+  const DEFAULTS = { maxSuppressionDb: 15, noiseBiasDb: 9 };
   const FRAME = 2048;
 
   let settings = { ...DEFAULTS };

@@ -1,7 +1,10 @@
-// Spectral subtraction with adaptive noise estimation. Music-safe: no ML, no
-// speech model, no user-picked profile. Tuned against the Rach 3 samples in
-// ../../samples. Plain JS, zero allocations after construction, so the same
-// file runs inside an AudioWorklet and inside the Node harness.
+// MMSE-STSA suppression (Ephraim-Malah) with decision-directed a priori SNR.
+// The DD recursion is the temporal smoother; there is deliberately NO
+// gain-domain smoothing (it costs 0.5-1.5 dB per partial and smears piano
+// attacks). Raw spectral subtraction was replaced after round-1 listening
+// found it muffled/underwater: its hard gate deleted everything at 4-12 dB
+// local SNR (accompaniment, reverb tails). A bypass flag forces unity gain
+// on all bins (bit-exact delay line, same latency) for toggle-off.
 //
 // Noise estimation, two ingredients:
 //
@@ -36,10 +39,9 @@ export class SpectralSubtractor {
       sampleRate = 48000,
       frameSize = 2048,
       hopSize = 1024,
-      alpha = 1.0,
-      maxSuppressionDb = 12,
-      noiseBiasDb = 3,
-      noiseRiseSec = 60,
+      maxSuppressionDb = 15,
+      noiseBiasDb = 9,
+      noiseRiseSec = 8,
       warmupSec = 0.5,
       smoothBeta = 0.75,
       maxProcessHz = 16000,
@@ -56,7 +58,6 @@ export class SpectralSubtractor {
     this.H = hopSize;
     this.bins = (frameSize >> 1) + 1;
 
-    this.alpha = alpha;
     this.gFloor = Math.pow(10, -maxSuppressionDb / 20);
     this.noiseBias = Math.pow(10, noiseBiasDb / 20);
     this.beta = smoothBeta;
@@ -102,11 +103,11 @@ export class SpectralSubtractor {
     this.crossIm = new Float32Array(this.bins);
     this.magProd = new Float32Array(this.bins);
     this.coherence = new Float32Array(this.bins);
-    this.prevGain = new Float32Array(this.bins);
-    this.gainTmp = new Float32Array(this.bins);
     this.gain = new Float32Array(this.bins);
-    this.prevGain.fill(1);
+    this.pSmooth = new Float32Array(this.bins);
+    this.cleanPow = new Float32Array(this.bins);
     this.gain.fill(1);
+    this.bypass = false;
 
     // Output FIFO, preloaded with N zeros (= the latency).
     this.fifoCapacity = 8 * this.N;
@@ -118,10 +119,8 @@ export class SpectralSubtractor {
   // Scalar-only runtime update for the options page path. Clamps instead of
   // throwing (the audio thread must never die on untrusted input) and
   // allocates nothing, so it is safe to call from a worklet message handler.
+  // Unknown keys (e.g. the retired alpha) are ignored.
   setParams(params = {}) {
-    if (params.alpha !== undefined && Number.isFinite(params.alpha)) {
-      this.alpha = Math.max(0, Math.min(8, params.alpha));
-    }
     if (params.maxSuppressionDb !== undefined && Number.isFinite(params.maxSuppressionDb)) {
       const db = Math.max(0, Math.min(40, params.maxSuppressionDb));
       this.gFloor = Math.pow(10, -db / 20);
@@ -130,6 +129,12 @@ export class SpectralSubtractor {
       const db = Math.max(0, Math.min(20, params.noiseBiasDb));
       this.noiseBias = Math.pow(10, db / 20);
     }
+  }
+
+  // Toggle-off path: unity gain on every bin, estimator keeps running warm,
+  // delay unchanged. Bit-exact (verified in test-dsp.mjs).
+  setBypassed(bypassed) {
+    this.bypass = !!bypassed;
   }
 
   process(input, output) {    const len = input.length;
@@ -149,6 +154,7 @@ export class SpectralSubtractor {
     const {
       N, H, bins, window, frameRe, frameIm, smoothed, power,
       est, noise, prevRe, prevIm, crossRe, crossIm, magProd, coherence,
+      pSmooth, cleanPow,
     } = this;
 
     // Windowed analysis frame.
@@ -169,6 +175,7 @@ export class SpectralSubtractor {
       const p = xr * xr + xi * xi;
       power[k] = p;
       totalPower += p;
+      pSmooth[k] = 0.5 * pSmooth[k] + 0.5 * p; // 2-frame periodogram average
       smoothed[k] = this.beta * smoothed[k] + this.oneMinusBeta * p;
 
       const pr = xr * prevRe[k] + xi * prevIm[k];
@@ -203,34 +210,40 @@ export class SpectralSubtractor {
       this.framesSeen++;
     }
 
-    // Gains: G = clamp(1 - alpha * N / |X|^2), then temporal and frequency
-    // smoothing to keep residuals from turning into musical noise.
+    // Gains: MMSE-STSA (Ephraim-Malah 1984, eq. 13) with decision-directed
+    // a priori SNR (eq. 51, alpha 0.98). The DD recursion is the temporal
+    // smoother, so there is no gain-domain smoothing at all. Bypass forces
+    // unity gain (bit-exact delay line, same latency) for toggle-off.
     const gFloor = this.gFloor;
-    const alpha = this.alpha;
-    const gainTmp = this.gainTmp;
-    const prevGain = this.prevGain;
     const gain = this.gain;
+    const bypass = this.bypass;
+    const DD_ALPHA = 0.98;
+    const XI_MIN = 0.0031622776601683794; // -25 dB
+    const XI_MAX = 1000;
 
     for (let k = 0; k <= this.maxBin; k++) {
-      const n = noise[k];
-      let g = 1 - (alpha * n) / (power[k] + 1e-20);
-      if (g < gFloor) g = gFloor;
-      else if (g > 1) g = 1;
-      const prev = prevGain[k];
-      // Fast when suppression deepens, moderate when releasing.
-      const smoothedG = prev + (g - prev) * (g < prev ? 0.35 : 0.5);
-      prevGain[k] = smoothedG;
-      gainTmp[k] = smoothedG;
-    }
-    for (let k = this.maxBin + 1; k < bins; k++) {
-      prevGain[k] = 1;
-      gainTmp[k] = 1;
-    }
+      if (bypass) {
+        gain[k] = 1;
+        cleanPow[k] = power[k];
+        continue;
+      }
+      const n = noise[k] + 1e-20;
 
-    gain[0] = gainTmp[0];
-    gain[bins - 1] = gainTmp[bins - 1];
-    for (let k = 1; k < bins - 1; k++) {
-      gain[k] = 0.25 * gainTmp[k - 1] + 0.5 * gainTmp[k] + 0.25 * gainTmp[k + 1];
+      let gamma = pSmooth[k] / n;
+      if (gamma < 1e-6) gamma = 1e-6;
+      else if (gamma > 1e4) gamma = 1e4;
+
+      let xi = DD_ALPHA * (cleanPow[k] / n) + (1 - DD_ALPHA) * (gamma > 1 ? gamma - 1 : 0);
+      if (xi < XI_MIN) xi = XI_MIN;
+      else if (xi > XI_MAX) xi = XI_MAX;
+
+      gain[k] = stsGain(xi, gamma, gFloor);
+      cleanPow[k] = gain[k] * gain[k] * power[k];
+    }
+    gain[0] = 1;
+    for (let k = this.maxBin + 1; k < bins; k++) {
+      gain[k] = 1;
+      cleanPow[k] = power[k];
     }
 
     // Apply gains; mirror onto the negative-frequency bins.
@@ -287,4 +300,82 @@ export class SpectralSubtractor {
     this.fifoCount--;
     return v;
   }
+}
+
+// Modified Bessel functions of the first kind, Abramowitz & Stegun 9.8.1 /
+// 9.8.2. |error| < 1.6e-7, ~12 flops each, no tables, no allocation.
+export function besselI0(x) {
+  const ax = Math.abs(x);
+  if (ax < 3.75) {
+    const t = (x / 3.75) * (x / 3.75);
+    return (
+      1 +
+      t *
+        (3.5156229 +
+          t *
+            (3.0899424 +
+              t * (1.2067492 + t * (0.2659732 + t * (0.0360768 + t * 0.0045813)))))
+    );
+  }
+  const y = 3.75 / ax;
+  return (
+    (Math.exp(ax) / Math.sqrt(ax)) *
+    (0.39894228 +
+      y *
+        (0.01328592 +
+          y *
+            (0.00225319 +
+              y *
+                (-0.00157565 +
+                  y *
+                    (0.00916281 +
+                      y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))))
+  );
+}
+
+export function besselI1(x) {
+  const ax = Math.abs(x);
+  let r;
+  if (ax < 3.75) {
+    const t = (x / 3.75) * (x / 3.75);
+    r =
+      x *
+      (0.5 +
+        t *
+          (0.87890594 +
+            t * (0.51498869 + t * (0.15084934 + t * (0.02658733 + t * (0.00301532 + t * 0.00032411))))));
+  } else {
+    const y = 3.75 / ax;
+    r =
+      (Math.exp(ax) / Math.sqrt(ax)) *
+      (0.39894228 +
+        y *
+          (-0.03988024 +
+            y *
+              (-0.00362018 +
+                y *
+                  (0.00163801 +
+                    y * (-0.01031555 + y * (0.02282967 + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059))))))));
+  }
+  return x < 0 ? -r : r;
+}
+
+// MMSE-STSA gain (Ephraim-Malah 1984, eq. 13) for a priori SNR xi and
+// a posteriori SNR gamma, clamped to [gFloor, 1]. nu > 50 uses the Wiener
+// asymptote (exact to 0.043 dB, avoids exp overflow).
+export function stsGain(xi, gamma, gFloor = 0) {
+  const nu = (xi * gamma) / (1 + xi);
+  let g;
+  if (nu > 50) {
+    g = xi / (1 + xi);
+  } else {
+    const h = 0.5 * nu;
+    g =
+      ((0.8862269254527580 * Math.sqrt(nu)) / gamma) *
+      Math.exp(-h) *
+      ((1 + nu) * besselI0(h) + nu * besselI1(h));
+  }
+  if (g < gFloor) g = gFloor;
+  else if (g > 1) g = 1;
+  return g;
 }

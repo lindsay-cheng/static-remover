@@ -14,25 +14,23 @@ class StaticRemoverProcessor extends AudioWorkletProcessor {
     const o = (options && options.processorOptions) || {};
     this.frameSize = o.frameSize || 2048;
     this.settings = {
-      alpha: o.alpha ?? 1.0,
-      maxSuppressionDb: o.maxSuppressionDb ?? 12,
-      noiseBiasDb: o.noiseBiasDb ?? 3,
+      maxSuppressionDb: o.maxSuppressionDb ?? 15,
+      noiseBiasDb: o.noiseBiasDb ?? 9,
     };
     this.enabled = false;
     this.errorSent = false;
     this.channels = [];
 
     for (let i = 0; i < 2; i++) {
-      this.channels.push(
-        new SpectralSubtractor({
-          sampleRate,
-          frameSize: this.frameSize,
-          hopSize: this.frameSize / 2,
-          alpha: 0, // start bypassed; no processing until enabled
-          maxSuppressionDb: this.settings.maxSuppressionDb,
-          noiseBiasDb: this.settings.noiseBiasDb,
-        }),
-      );
+      const s = new SpectralSubtractor({
+        sampleRate,
+        frameSize: this.frameSize,
+        hopSize: this.frameSize / 2,
+        maxSuppressionDb: this.settings.maxSuppressionDb,
+        noiseBiasDb: this.settings.noiseBiasDb,
+      });
+      s.setBypassed(true); // start bypassed; no processing until enabled
+      this.channels.push(s);
     }
 
     this.port.onmessage = (e) => this.onMessage(e.data);
@@ -43,7 +41,7 @@ class StaticRemoverProcessor extends AudioWorkletProcessor {
     if (m.type === 'enabled') {
       this.enabled = !!m.value;
       if (m.value) this.applyConfig(m);
-      else this.setAlphaAll(0);
+      for (const s of this.channels) s.setBypassed(!this.enabled);
       return;
     }
     if (m.type === 'config') {
@@ -52,20 +50,14 @@ class StaticRemoverProcessor extends AudioWorkletProcessor {
   }
 
   applyConfig(m) {
-    if (Number.isFinite(m.alpha)) this.settings.alpha = m.alpha;
     if (Number.isFinite(m.maxSuppressionDb)) this.settings.maxSuppressionDb = m.maxSuppressionDb;
     if (Number.isFinite(m.noiseBiasDb)) this.settings.noiseBiasDb = m.noiseBiasDb;
     for (const s of this.channels) {
       s.setParams({
-        alpha: this.enabled ? this.settings.alpha : 0,
         maxSuppressionDb: this.settings.maxSuppressionDb,
         noiseBiasDb: this.settings.noiseBiasDb,
       });
     }
-  }
-
-  setAlphaAll(a) {
-    for (const s of this.channels) s.setParams({ alpha: a });
   }
 
   process(inputs, outputs) {

@@ -17,8 +17,7 @@ if [ -z "$NODE" ]; then
   NODE="deno run --allow-read --allow-write"
 fi
 
-ALPHA="${ALPHA:-2.0}"
-SUPP="${SUPP:-18}"
+SUPP="${SUPP:-15}"
 BIAS="${BIAS:-9}"
 RISE="${RISE:-8}"
 
@@ -36,7 +35,7 @@ band_rms() {
 
 for s in sampleA sampleB sampleC; do
   ffmpeg -hide_banner -loglevel error -y -i "$SAMPLES/$s.m4a" -c:a pcm_s16le "$OUT/$s-in.wav"
-  $NODE "$HERE/denoise-file.mjs" "$OUT/$s-in.wav" "$OUT/$s-clean.wav" --alpha "$ALPHA" --max-suppression-db "$SUPP" --noise-bias-db "$BIAS" --noise-rise-sec "$RISE"
+  $NODE "$HERE/denoise-file.mjs" "$OUT/$s-in.wav" "$OUT/$s-clean.wav" --max-suppression-db "$SUPP" --noise-bias-db "$BIAS" --noise-rise-sec "$RISE"
   ffmpeg -hide_banner -loglevel error -y -i "$OUT/$s-clean.wav" -lavfi "showspectrumpic=s=1400x720:legend=1:scale=log:color=intensity" "$OUT/spec-$s-clean.png"
 done
 
