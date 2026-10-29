@@ -85,6 +85,15 @@ export class SpectralSubtractor {
     this.bandP = new Float64Array(24);
     this.bandN = new Float64Array(24);
     this.bandLift = new Float64Array(24);
+    // Air-preservation cap (Cedar-style classical practice): above 8 kHz,
+    // cap suppression at (maxSuppressionDb - 7) dB -- at default settings
+    // -8 dB max up top instead of -15. Orchestral brilliance and hall air
+    // live here alongside the hiss; hard cleaning thins timbre audibly
+    // (measured: -4.3 dB selective HF loss in medium passages). Scales with
+    // the strength slider (aggressive floors still bite; gentle floors pass
+    // highs through entirely).
+    this.hiK = Math.min(this.maxBin, Math.ceil((8000 * frameSize) / sampleRate));
+    this.hiFloor = Math.pow(10, -Math.max(0, maxSuppressionDb - 7) / 20);
     this.noiseBias = Math.pow(10, noiseBiasDb / 20);
     this.beta = smoothBeta;
     this.oneMinusBeta = 1 - smoothBeta;
@@ -166,6 +175,7 @@ export class SpectralSubtractor {
       const db = Math.max(0, Math.min(40, params.maxSuppressionDb));
       this.gFloor = Math.pow(10, -db / 20);
       this.maxSuppressionDb = db;
+      this.hiFloor = Math.pow(10, -Math.max(0, db - 7) / 20);
       const sDb = Math.max(1, db);
       this.toneCapDiv = Math.max(1, Math.min(32, Math.round(8 * (15 / sDb) * (15 / sDb))));
     }
@@ -433,7 +443,7 @@ export class SpectralSubtractor {
       if (xi < XI_MIN) xi = XI_MIN;
       else if (xi > XI_MAX) xi = XI_MAX;
 
-      gain[k] = stsGain(xi, gamma, liftedFloor);
+      gain[k] = stsGain(xi, gamma, k >= this.hiK ? Math.max(liftedFloor, this.hiFloor) : liftedFloor);
       cleanPow[k] = gain[k] * gain[k] * power[k];
     }
     // Masking-aware lift (iZotope-style): where the residual hiss sits far
