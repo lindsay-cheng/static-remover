@@ -1,10 +1,36 @@
 // Service worker: no audio here. Toolbar click / keyboard shortcut -> ask the
-// content script to toggle. Badge reflects per-tab state.
+// content script to toggle. Badge reflects per-tab state. Failures are shown
+// on the badge ("?") instead of failing silently.
 
 async function setBadge(tabId, enabled) {
   await chrome.action.setBadgeText({ tabId, text: enabled ? 'ON' : '' });
+  await chrome.action.setTitle({ tabId, title: 'Toggle static removal' });
   if (enabled) {
     await chrome.action.setBadgeBackgroundColor({ tabId, color: '#000000' });
+  }
+}
+
+async function showProblem(tabId) {
+  await chrome.action.setBadgeText({ tabId, text: '?' });
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: '#cc0000' });
+  await chrome.action.setTitle({
+    tabId,
+    title: 'Static Remover: reload this YouTube tab, then click again',
+  });
+}
+
+// The content script only auto-injects into tabs opened after install. For a
+// tab that predates the install, inject it on demand and retry once.
+async function ensureContentScript(tabId, url) {
+  if (!/^https:\/\/(www\.)?youtube\.com\//.test(url || '')) return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['src/content/content.js'],
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -12,10 +38,22 @@ async function toggle(tab) {
   if (!tab?.id) return;
   try {
     const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
+    if (res?.ok === false) {
+      console.warn('[static-remover] toggle failed:', res?.error);
+      await showProblem(tab.id);
+      return;
+    }
     await setBadge(tab.id, !!res?.enabled);
+    return;
   } catch {
-    // No content script in this tab (not YouTube, or still loading).
-    await setBadge(tab.id, false);
+    if (await ensureContentScript(tab.id, tab.url)) {
+      try {
+        const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
+        await setBadge(tab.id, !!res?.enabled);
+        return;
+      } catch {}
+    }
+    await showProblem(tab.id);
   }
 }
 
