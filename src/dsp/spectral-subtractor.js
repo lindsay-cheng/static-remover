@@ -61,14 +61,27 @@ export class SpectralSubtractor {
     this.gFloor = Math.pow(10, -maxSuppressionDb / 20);
     this.maxSuppressionDb = maxSuppressionDb;
     this.maxBin = Math.min(this.bins - 1, Math.round((maxProcessHz * frameSize) / sampleRate));
-    // Subband edges for per-band trust (<500 Hz / 500 Hz-4 kHz / >4 kHz).
-    // NOTE: maxBin must be set first (it bounds the edges).
-    this.loK = Math.min(this.maxBin, Math.ceil((500 * frameSize) / sampleRate));
-    this.midK = Math.min(this.maxBin, Math.ceil((4000 * frameSize) / sampleRate));
+    // Bark-band index per bin for the masking lift (255 = no band).
+    this.binBand = new Uint8Array(this.bins).fill(255);
+    {
+      const barkEdges = [
+        100, 200, 300, 400, 510, 630, 770, 920, 1080, 1270, 1480, 1720,
+        2000, 2320, 2700, 3150, 3700, 4400, 5300, 6400, 7700, 9500,
+        12000, 15500, 19000,
+      ];
+      const binHz = sampleRate / frameSize;
+      for (let b = 0; b < 24; b++) {
+        const lo = Math.max(1, Math.floor(barkEdges[b] / binHz));
+        const hi = Math.min(this.maxBin, Math.ceil(barkEdges[b + 1] / binHz) - 1);
+        for (let k = lo; k <= hi; k++) this.binBand[k] = b;
+      }
+    }
+    this.bandP = new Float64Array(24);
+    this.bandN = new Float64Array(24);
+    this.bandLift = new Float64Array(24);
     this.noiseBias = Math.pow(10, noiseBiasDb / 20);
     this.beta = smoothBeta;
     this.oneMinusBeta = 1 - smoothBeta;
-    this.maxBin = Math.min(this.bins - 1, Math.round((maxProcessHz * frameSize) / sampleRate));
     this.tonalityGate = tonalityGate;
     this.tripRatio = tripRatio;
     this.tripFrames = tripFrames;
@@ -118,6 +131,7 @@ export class SpectralSubtractor {
     this.est = new Float32Array(this.bins);
     this.slowMin = new Float32Array(this.bins);
     this.noise = new Float32Array(this.bins);
+    this.noiseS = new Float32Array(this.bins);
     this.prevRe = new Float32Array(this.bins);
     this.prevIm = new Float32Array(this.bins);
     this.crossRe = new Float32Array(this.bins);
@@ -175,7 +189,8 @@ export class SpectralSubtractor {
     const {
       N, H, bins, window, frameRe, frameIm, smoothed, power,
       est, slowMin, noise, prevRe, prevIm, crossRe, crossIm, magProd, coherence,
-      pSmooth, cleanPow, tripCount, starve,
+      pSmooth, cleanPow, tripCount, starve, noiseS,
+      binBand, bandP, bandN, bandLift,
     } = this;
 
     // Windowed analysis frame.
@@ -342,6 +357,15 @@ export class SpectralSubtractor {
     }
     const starvedFrac = starved / (this.maxBin + 1);
     const liftedFloor = Math.pow(gFloor, 1 - 0.85 * starvedFrac);
+    // Spectral smoothing of the noise estimate (libspecbleach): our noise[]
+    // is the only un-smoothed quantity feeding the MMSE gain, and single-bin
+    // floor spikes become single-bin gain wells (sparkle). 3-tap box blended
+    // 50% kills them with zero temporal smearing. Edges clamp.
+    noiseS[0] = 0.5 * noise[0] + 0.5 * ((noise[0] + noise[1]) / 2);
+    for (let k = 1; k < bins - 1; k++) {
+      noiseS[k] = 0.5 * noise[k] + 0.5 * ((noise[k - 1] + noise[k] + noise[k + 1]) / 3);
+    }
+    noiseS[bins - 1] = 0.5 * noise[bins - 1] + 0.5 * ((noise[bins - 2] + noise[bins - 1]) / 2);
     const maxSuppDb = this.maxSuppressionDb;
     const gain = this.gain;
     const bypass = this.bypass;
@@ -374,7 +398,7 @@ export class SpectralSubtractor {
       // safe: a hiss bin misread as tonal is only mildly under-suppressed
       // for a frame, never passed through (an exact bypass let white-noise
       // spikes through and collapsed the noise cut).
-      let n = noise[k] + 1e-20;
+      let n = noiseS[k] + 1e-20;
       if (coherence[k] >= gateT) {
         const cap = power[k] * 0.125 + 1e-20;
         if (n > cap) n = cap;
@@ -390,6 +414,62 @@ export class SpectralSubtractor {
 
       gain[k] = stsGain(xi, gamma, liftedFloor);
       cleanPow[k] = gain[k] * gain[k] * power[k];
+    }
+    // Masking-aware lift (iZotope-style): where the residual hiss sits far
+    // below the music in a Bark band, ease suppression back toward unity --
+    // removing inaudible noise buys nothing and costs detail. liftDb ramps
+    // 0-8 dB from 18 dB band SNR, smoothed across bands; capped so it can
+    // never undo the requested reduction, and applied before spike repair
+    // (whistle-closing wins ties).
+    {
+      bandP.fill(0);
+      bandN.fill(0);
+      for (let k = 1; k <= this.maxBin; k++) {
+        const b = binBand[k];
+        if (b === 255) continue;
+        const g = gain[k];
+        bandP[b] += pSmooth[k];
+        bandN[b] += noiseS[k] * g * g;
+      }
+      for (let b = 0; b < 24; b++) {
+        const s = bandP[b] - bandN[b];
+        const snr = 10 * Math.log10((s > 0 ? s : 0) / (bandN[b] + 1e-20) + 1e-20);
+        const lift = 0.5 * (snr - 18);
+        bandLift[b] = lift < 0 ? 0 : lift > 8 ? 8 : lift;
+      }
+      let prev = bandLift[0];
+      for (let b = 0; b < 23; b++) {
+        const cur = bandLift[b];
+        bandLift[b] = 0.25 * prev + 0.5 * cur + 0.25 * bandLift[b + 1];
+        prev = cur;
+      }
+      for (let k = 1; k <= this.maxBin; k++) {
+        const b = binBand[k];
+        if (b === 255) continue;
+        const l = bandLift[b];
+        if (l > 0.05) {
+          const g = gain[k] * Math.pow(10, l / 20);
+          gain[k] = g > 1 ? 1 : g;
+          cleanPow[k] = gain[k] * gain[k] * power[k];
+        }
+      }
+    }
+    // Isolated-spike repair (SoX "tinkle bell"): a lone half-open bin amid
+    // deeply suppressed neighbours is a musical-noise whistle -- close it.
+    // Thresholds widened slightly for a continuous (non-binary) gain field.
+    for (let k = 2; k <= this.maxBin - 2; k++) {
+      const g = gain[k];
+      if (
+        g >= 0.45 &&
+        g <= 0.58 &&
+        gain[k - 1] < 0.15 &&
+        gain[k - 2] < 0.15 &&
+        gain[k + 1] < 0.15 &&
+        gain[k + 2] < 0.15
+      ) {
+        gain[k] = liftedFloor;
+        cleanPow[k] = liftedFloor * liftedFloor * power[k];
+      }
     }
     gain[0] = 1;
     for (let k = this.maxBin + 1; k < bins; k++) {
