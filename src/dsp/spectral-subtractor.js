@@ -610,6 +610,29 @@ export class SpectralSubtractor {
       cleanPow[k] = power[k];
     }
 
+    // De-hum notch (measured 48.5 Hz drone on the Rach 3 recording: same
+    // frequency to 0.03 Hz across passages 12 min apart, constant level
+    // while music swings 25 dB -- a mains/motor drone, not music). Single
+    // STFT bin (~23 Hz wide), so it is quiet-gated (restFrac high: hum is
+    // only audible in quiet frames anyway) AND harmonic-checked: piano G1
+    // (49 Hz) shares the bin, but a real G1 rings 2x/3x partials while the
+    // drone's harmonics are absent -- if either harmonic bin reads above
+    // the floor, a note is sounding and the notch stands down. Depth fixed
+    // at -18 dB (residual -68 dBFS: inaudible, never zero). No new UI: an
+    // automatic targeted stage, one toggle preserved.
+    if (!bypass && restFrac > 0.6) {
+      const notchBin = Math.round((48.5 * this.N) / this.sampleRate);
+      if (notchBin >= 1 && 3 * notchBin <= this.maxBin) {
+        const h2 = power[2 * notchBin] < noise[2 * notchBin] * 4;
+        const h3 = power[3 * notchBin] < noise[3 * notchBin] * 4;
+        if (h2 && h3) {
+          const ng = gain[notchBin] < 0.125 ? gain[notchBin] : 0.125;
+          gain[notchBin] = ng;
+          cleanPow[notchBin] = ng * ng * power[notchBin];
+        }
+      }
+    }
+
     // Asymmetric gain smoothing: open fast, close slowly. Bypass snaps to
     // unity (toggle-off stays bit-exact); bin 0 is pinned to 1 so DC
     // reconstruction stays exact. cleanPow tracks the APPLIED gain so the
