@@ -15,7 +15,7 @@ class StaticRemoverProcessor extends AudioWorkletProcessor {
     this.frameSize = o.frameSize || 2048;
     this.settings = {
       maxSuppressionDb: o.maxSuppressionDb ?? 15,
-      noiseBiasDb: o.noiseBiasDb ?? 9,
+      noiseBiasDb: o.noiseBiasDb ?? 6,
     };
     this.enabled = false;
     this.errorSent = false;

@@ -32,11 +32,9 @@ const optionFlags = {
   'max-suppression-db': 'maxSuppressionDb',
   'noise-bias-db': 'noiseBiasDb',
   'noise-rise-sec': 'noiseRiseSec',
-  'suppression-knee-db': 'suppressionKneeDb',
-  'slow-rise-sec': 'slowRiseSec',
-  'slow-margin': 'slowMargin',
+  'transient-ratio': 'transientRatio',
   'tonality-gate': 'tonalityGate',
-  'warmup-sec': 'warmupSec',
+  'init-sec': 'initSec',
 };
 const options = {};
 for (const [flag, key] of Object.entries(optionFlags)) {

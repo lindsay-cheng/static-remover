@@ -6,23 +6,18 @@
 // local SNR (accompaniment, reverb tails). A bypass flag forces unity gain
 // on all bins (bit-exact delay line, same latency) for toggle-off.
 //
-// Noise estimation, two ingredients:
+// Noise estimation: asymmetric envelope of the smoothed spectrum (instant
+// fall to dips, slow rise) with tonal bins rejecting observations (phase
+// coherence: tones advance identically every frame, noise does not), plus
+// a tripwire forcing updates on persistent divergence. A slow global-minimum
+// anchor pins runaway estimates near the true floor remembered from quieter
+// moments (minute-scale creep, so loud stretches barely move it).
+// Suppression is governed per bin by calm-ease: consecutive calm frames
+// (power near its average = sustained content) progressively spare the bin;
+// fluctuation earns full cleaning.
 //
-// 1. Asymmetric envelope tracker. Per bin, the estimate follows the smoothed
-//    power spectrum's lower envelope: falling fast (tracks the floor dropping,
-//    e.g. the loud first 15 s of the Rach 3 upload) and rising slowly
-//    (~noiseRiseSec time constant, so loud transients and musical notes can
-//    never slam it up).
-//
-// 2. Tonality gate. A purely statistical estimator cannot tell a sustained
-//    tone from noise -- a held note eventually gets absorbed and crushed.
-//    The discriminator is phase coherence: a tone's STFT phase advances by
-//    the same amount every frame, noise's phase is random. Bins that look
-//    tonal freeze their noise estimate entirely, so musical notes, held or
-//    decaying, are never mistaken for the floor.
-//
-// Estimation starts after a short warmup (coherence needs a few frames to
-// become meaningful), and silence frames freeze it so pause/mute is safe.
+// Gated estimation starts after ~2 s; before that the output passes
+// through. Silence freezes estimation (pause/mute safe).
 //
 // Streaming contract: process(input, output) with input.length === output.length.
 // output[i] is the cleaned version of input[i - frameSize] (latency = frameSize
@@ -40,16 +35,18 @@ export class SpectralSubtractor {
       frameSize = 2048,
       hopSize = 1024,
       maxSuppressionDb = 15,
-      noiseBiasDb = 9,
+      noiseBiasDb = 6,
       noiseRiseSec = 8,
-      suppressionKneeDb = 12,
       slowRiseSec = 600,
       slowMargin = 1.5,
-      warmupSec = 0.5,
+      transientRatio = 3,
+      initSec = 2.0,
       smoothBeta = 0.75,
       maxProcessHz = 16000,
-      tonalityGate = 0.5,
+      tonalityGate = 0.8,
       coherenceLambda = 0.9,
+      tripRatio = 4,
+      tripFrames = 25,
     } = options;
 
     if (hopSize !== frameSize / 2) {
@@ -63,12 +60,18 @@ export class SpectralSubtractor {
 
     this.gFloor = Math.pow(10, -maxSuppressionDb / 20);
     this.maxSuppressionDb = maxSuppressionDb;
-    this.suppressionKneeDb = suppressionKneeDb;
+    this.maxBin = Math.min(this.bins - 1, Math.round((maxProcessHz * frameSize) / sampleRate));
+    // Subband edges for per-band trust (<500 Hz / 500 Hz-4 kHz / >4 kHz).
+    // NOTE: maxBin must be set first (it bounds the edges).
+    this.loK = Math.min(this.maxBin, Math.ceil((500 * frameSize) / sampleRate));
+    this.midK = Math.min(this.maxBin, Math.ceil((4000 * frameSize) / sampleRate));
     this.noiseBias = Math.pow(10, noiseBiasDb / 20);
     this.beta = smoothBeta;
     this.oneMinusBeta = 1 - smoothBeta;
     this.maxBin = Math.min(this.bins - 1, Math.round((maxProcessHz * frameSize) / sampleRate));
     this.tonalityGate = tonalityGate;
+    this.tripRatio = tripRatio;
+    this.tripFrames = tripFrames;
     this.lambda = coherenceLambda;
     this.oneMinusLambda = 1 - coherenceLambda;
 
@@ -77,11 +80,15 @@ export class SpectralSubtractor {
     const framesPerSec = sampleRate / hopSize;
     this.estFall = 0.1;
     this.estRise = 1 / (noiseRiseSec * framesPerSec);
-    // Slow anchor creep: doubling per slowRiseSec (minute-scale), so even
-    // minutes of continuous tutti can only drag the anchor up ~1-2 dB.
+    // Slow anchor: doubling per slowRiseSec (minute-scale), so extended
+    // loud stretches can only drag the floor memory up ~1-2 dB.
     this.slowCreep = Math.pow(2, 1 / (slowRiseSec * framesPerSec));
     this.slowMargin = slowMargin;
-    this.warmupFrames = Math.round(warmupSec * framesPerSec);
+    this.transientRatio = transientRatio;
+    // Gated estimation starts after ~2 s of floor evidence; before that the
+    // output passes through (a brief fade-in, and the only honest answer
+    // before floor evidence exists).
+    this.initFrames = Math.round(initSec * framesPerSec);
     this.framesSeen = 0;
 
     this.fft = new FFT(frameSize);
@@ -100,6 +107,10 @@ export class SpectralSubtractor {
     this.frameIm = new Float32Array(this.N);
     this.ola = new Float32Array(this.N);
     this.norm = new Float32Array(this.N);
+    this.updateFlag = new Uint8Array(this.bins);
+    this.tripCount = new Uint16Array(this.bins);
+    this.starve = new Uint16Array(this.bins);
+    this.initDone = false;
 
     // Per-bin spectrum state.
     this.power = new Float32Array(this.bins);
@@ -164,7 +175,7 @@ export class SpectralSubtractor {
     const {
       N, H, bins, window, frameRe, frameIm, smoothed, power,
       est, slowMin, noise, prevRe, prevIm, crossRe, crossIm, magProd, coherence,
-      pSmooth, cleanPow,
+      pSmooth, cleanPow, tripCount, starve,
     } = this;
 
     // Windowed analysis frame.
@@ -176,6 +187,12 @@ export class SpectralSubtractor {
 
     // Power spectrum, smoothed spectrum, and frame-to-frame phase coherence.
     // Coherence ~1 => tonal (a tone's phase advances constantly), ~0 => noise.
+    // CUTOFF SNAP: histories (coherence averages, DD clean power) are trailed
+    // by loud past energy -- after a 12 dB+ single-frame drop they would
+    // claim "tone" for seconds (measured: stuck gains for 4+ s after a
+    // cutoff). A sharp drop means the past no longer describes the present,
+    // so restart all history from current evidence. Gradual decays (piano
+    // dampers, hall tails) never drop this fast and are unaffected.
     const lambda = this.lambda;
     const oneMinusLambda = this.oneMinusLambda;
     let totalPower = 0;
@@ -188,6 +205,25 @@ export class SpectralSubtractor {
       pSmooth[k] = 0.5 * pSmooth[k] + 0.5 * p; // 2-frame periodogram average
       smoothed[k] = this.beta * smoothed[k] + this.oneMinusBeta * p;
 
+      if (p < smoothed[k] * 0.0625 && smoothed[k] > 1e-8) {
+        // Restart HISTORY from current evidence (coherence averages, DD
+        // clean power, tripwire) so stale loud past stops claiming "tone".
+        // Deliberately does NOT touch est/slowMin/noise: floor estimation
+        // stays with the gated updates (seeding them here with single-frame
+        // dip outliers poisons slowMin for minutes -- measured: cut collapsed
+        // from -15 dB to -2 dB). With coherence reset to 0 the gate opens on
+        // the next frame and normal updates reconverge within ~0.5 s.
+        crossRe[k] = 0;
+        crossIm[k] = 0;
+        magProd[k] = 0;
+        prevRe[k] = xr;
+        prevIm[k] = xi;
+        coherence[k] = 0;
+        cleanPow[k] = p;
+        tripCount[k] = 0;
+        continue;
+      }
+
       const pr = xr * prevRe[k] + xi * prevIm[k];
       const pi = xi * prevRe[k] - xr * prevIm[k];
       prevRe[k] = xr;
@@ -199,40 +235,92 @@ export class SpectralSubtractor {
       coherence[k] = Math.sqrt(crossRe[k] * crossRe[k] + crossIm[k] * crossIm[k]) / (magProd[k] + 1e-20);
     }
 
-    // Noise floor = lower envelope of the smoothed spectrum, biased up to the
-    // mean noise level. Tonal bins and silence frames freeze the estimate so
-    // notes and pause/mute are never absorbed.
+    // Floor estimation, two trackers with separate jobs:
+    //
+    // slowMin: free-running observation minima (gate-independent) = the
+    // floor's long memory. Falls instantly to dips, creeps up glacially
+    // (minute-scale), drifts down under starvation (no SUBSTANTIAL dip --
+    // 6 dB+ below the anchor -- for ~10 s means the anchor is stale loud
+    // memory, e.g. soft music after a loud stretch with no gaps; small
+    // breathing fluctuations must not reset the clock). Under-suppression
+    // is the safe direction throughout.
+    //
+    // est/noise: gated tracker (coherence rejects tonal observations) plus
+    // tripwire, seeded once from slowMin. Tonal bins REJECT observations
+    // (a sustained tone must never become the "floor"). Tripwire: DIVERGENT
+    // frames accumulate (4x either way) and force an update at 25, however
+    // intermittent the gate flicker is; agreement resets the count, so
+    // steady tones never trip. Gate at 0.8, above overlapped-noise readings
+    // (50% frame overlap inflates noise coherence to ~0.4-0.77; tones read
+    // 0.95+). Silence frames freeze everything so pause/mute is safe.
     if (totalPower > 1e-8) {
-      if (this.framesSeen >= this.warmupFrames) {
+      if (this.framesSeen >= this.initFrames) {
+        const bias = this.noiseBias;
+        if (!this.initDone) {
+          for (let k = 0; k < bins; k++) {
+            est[k] = smoothed[k];
+            slowMin[k] = smoothed[k];
+            noise[k] = smoothed[k] * bias;
+          }
+          this.initDone = true;
+        }
         const fall = this.estFall;
         const rise = this.estRise;
         const slowCreep = this.slowCreep;
         const slowMargin = this.slowMargin;
-        const bias = this.noiseBias;
         const gate = this.tonalityGate;
+        const tripRatio = this.tripRatio;
+        const tripFrames = this.tripFrames;
+        const updateFlag = this.updateFlag;
         for (let k = 0; k < bins; k++) {
-          if (coherence[k] < gate) {
-            const s = smoothed[k];
-            const e = est[k];
-            est[k] = e === 0 ? s : e + (s - e) * (s < e ? fall : rise);
-            // Slow global-minimum anchor: the fast envelope latches onto
-            // dense music (its minima are music, not hiss); the slow minimum
-            // remembers the true floor from quieter moments. Pin the estimate
-            // near it. Creep is minute-scale so extended tutti can only drag
-            // it up ~1-2 dB; genuine floor rises are under-tracked, which is
-            // the safe direction. Initialized from the first frames, so
-            // toggling mid-fortissimo starts hot and converges as dips arrive.
-            const m = slowMin[k];
-            if (m === 0) {
-              slowMin[k] = s;
-            } else if (s < m) {
-              slowMin[k] = s;
-            } else {
-              slowMin[k] = m * slowCreep;
-            }
-            const anchored = slowMin[k] * slowMargin;
-            noise[k] = (est[k] < anchored ? est[k] : anchored) * bias;
+          const s = smoothed[k];
+          const e = est[k];
+          if (e !== 0 && s <= e * tripRatio && s * tripRatio >= e) {
+            // Estimate agrees with observation: rejection (if any) is
+            // correct, clear any accumulated trip.
+            tripCount[k] = 0;
+            updateFlag[k] = coherence[k] < gate ? 1 : 0;
+            continue;
           }
+          // Divergent: open gate updates (converging); closed gate counts
+          // toward a forced update. Opens never reset the count, so gate
+          // flap cannot starve convergence.
+          if (coherence[k] < gate) {
+            updateFlag[k] = 1;
+            continue;
+          }
+          if (++tripCount[k] >= tripFrames) {
+            updateFlag[k] = 1;
+            tripCount[k] = 0;
+          } else {
+            updateFlag[k] = 0;
+          }
+          // Starvation clock for global ease (below): consecutive frames
+          // without a substantial dip (6 dB+ below est). Fluctuating audio
+          // resets constantly; sustained content accumulates. Uint16 caps
+          // the count (no wrap blips).
+          const p = power[k];
+          if (p > s * 0.5 && p < s * 2) {
+            if (starve[k] < 60000) starve[k]++;
+          } else {
+            starve[k] = 0;
+          }
+        }
+        for (let k = 0; k < bins; k++) {
+          if (!updateFlag[k]) continue;
+          const s = smoothed[k];
+          const e = est[k];
+          est[k] = e === 0 ? s : e + (s - e) * (s < e ? fall : rise);
+          const m = slowMin[k];
+          if (m === 0) {
+            slowMin[k] = s;
+          } else if (s < m) {
+            slowMin[k] = s;
+          } else {
+            slowMin[k] = m * slowCreep;
+          }
+          const anchored = slowMin[k] * slowMargin;
+          noise[k] = (est[k] < anchored ? est[k] : anchored) * bias;
         }
       }
       this.framesSeen++;
@@ -243,29 +331,21 @@ export class SpectralSubtractor {
     // smoother, so there is no gain-domain smoothing at all. Bypass forces
     // unity gain (bit-exact delay line, same latency) for toggle-off.
     //
-    // Loudness-aware ceiling: in loud frames the music masks the hiss, so
-    // deep suppression buys nothing and risks everything (this was round-2's
-    // "power of the orchestra is gone"). The allowed suppression per frame
-    // ramps from full maxSuppressionDb in quiet frames down to 0 dB
-    // (passthrough) once the frame's wideband SNR exceeds the knee.
+    // Global ease: fraction of bins starved of floor evidence (no 6 dB+
+    // dip for 2 s+). Sustained content starves broadly (post-transition
+    // soft music, long tutti); fluctuating audio resets constantly.
+    // Suppression eases proportionally -- no cliffs, self-calibrating.
+    const gFloor = this.gFloor;
+    let starved = 0;
+    for (let k = 0; k <= this.maxBin; k++) {
+      if (starve[k] > 94) starved++;
+    }
+    const starvedFrac = starved / (this.maxBin + 1);
+    const liftedFloor = Math.pow(gFloor, 1 - 0.85 * starvedFrac);
+    const maxSuppDb = this.maxSuppressionDb;
     const gain = this.gain;
     const bypass = this.bypass;
-    let frameFloor = this.gFloor;
-    if (!bypass) {
-      let sigPow = 0;
-      let noisePow = 0;
-      for (let k = 0; k <= this.maxBin; k++) {
-        sigPow += smoothed[k];
-        noisePow += noise[k];
-      }
-      const snrWb = 10 * Math.log10(sigPow / (noisePow + 1e-20) + 1e-20);
-      const maxSuppDb = this.maxSuppressionDb;
-      const allowedDb = Math.max(
-        0,
-        Math.min(maxSuppDb, maxSuppDb - Math.max(0, snrWb - this.suppressionKneeDb)),
-      );
-      frameFloor = Math.pow(10, -allowedDb / 20);
-    }
+    const gateT = this.tonalityGate;
     const DD_ALPHA = 0.98;
     const XI_MIN = 0.0031622776601683794; // -25 dB
     const XI_MAX = 1000;
@@ -276,7 +356,29 @@ export class SpectralSubtractor {
         cleanPow[k] = power[k];
         continue;
       }
-      const n = noise[k] + 1e-20;
+      // Transient gate: attacks and onsets pass untouched. power[] is the
+      // instantaneous frame energy, smoothed[] its slow average; a large
+      // ratio marks a transient (punch, bow attacks, percussion, detail).
+      // The steady wash -- hiss included -- is still suppressed. Single
+      // isolated noise spikes also pass, but at ~5% of bins they cost only
+      // ~0.2 dB of cut and cause no sparkle (no isolated gain wells form).
+      if (power[k] > 1e-10 && power[k] > this.transientRatio * smoothed[k]) {
+        gain[k] = 1;
+        cleanPow[k] = power[k];
+        continue;
+      }
+      // Tonal cap: a coherent bin is a sustained partial, so its SNR is at
+      // least +9 dB -- cap the assumed noise at 1/8 of observed power.
+      // Estimates may legitimately hold tone energy (seeding); without the
+      // cap they would crush partials and fading tails. Failure mode is
+      // safe: a hiss bin misread as tonal is only mildly under-suppressed
+      // for a frame, never passed through (an exact bypass let white-noise
+      // spikes through and collapsed the noise cut).
+      let n = noise[k] + 1e-20;
+      if (coherence[k] >= gateT) {
+        const cap = power[k] * 0.125 + 1e-20;
+        if (n > cap) n = cap;
+      }
 
       let gamma = pSmooth[k] / n;
       if (gamma < 1e-6) gamma = 1e-6;
@@ -286,7 +388,7 @@ export class SpectralSubtractor {
       if (xi < XI_MIN) xi = XI_MIN;
       else if (xi > XI_MAX) xi = XI_MAX;
 
-      gain[k] = stsGain(xi, gamma, frameFloor);
+      gain[k] = stsGain(xi, gamma, liftedFloor);
       cleanPow[k] = gain[k] * gain[k] * power[k];
     }
     gain[0] = 1;

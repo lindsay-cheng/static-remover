@@ -12,7 +12,7 @@
   // running in the tab (pre-fix builds logged nothing on injection).
   console.log('[static-remover] content script injected');
 
-  const DEFAULTS = { maxSuppressionDb: 15, noiseBiasDb: 9 };
+  const DEFAULTS = { maxSuppressionDb: 15, noiseBiasDb: 6 };
   const FRAME = 2048;
 
   let settings = { ...DEFAULTS };

@@ -18,7 +18,7 @@ if [ -z "$NODE" ]; then
 fi
 
 SUPP="${SUPP:-15}"
-BIAS="${BIAS:-9}"
+BIAS="${BIAS:-6}"
 RISE="${RISE:-8}"
 
 stats() {
