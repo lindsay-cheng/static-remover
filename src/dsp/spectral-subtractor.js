@@ -51,6 +51,8 @@ export class SpectralSubtractor {
       restExitFrac = 0.7,
       restEnterFrames = 32,
       restExtraDb = 10,
+      gainAttackMs = 15,
+      gainReleaseMs = 100,
     } = options;
 
     if (hopSize !== frameSize / 2) {
@@ -114,6 +116,20 @@ export class SpectralSubtractor {
     this.restEnterFrames = restEnterFrames;
     this.restExtraDb = restExtraDb;
     this.restFloor = Math.pow(10, -Math.min(40, maxSuppressionDb + restExtraDb) / 20);
+    // Gain-domain asymmetric smoothing (Audacity 20/100 ms practice; ours
+    // 15/100): one-pole coefficients per hop. Opens fast so attacks stay
+    // crisp, closes slowly so suppression never chatters or pumps between
+    // frames. Calibrated 2026-10-29: release 300 ms calmed flicker 5.3x but
+    // cost 5.5 dB steady cut (fast-up/slow-down ratchets open on flicker);
+    // 100 ms calms 2.9x for ~3.5 dB. The DD recursion smooths the estimate;
+    // this smooths only the applied field (feeding it back into cleanPow
+    // built an estimator loop that cost another 7 dB -- estimate fast,
+    // apply smooth).
+    const hopSec = hopSize / sampleRate;
+    this.gainAttackMs = Math.max(1, Math.min(100, gainAttackMs));
+    this.gainReleaseMs = Math.max(20, Math.min(2000, gainReleaseMs));
+    this.gainAttack = 1 - Math.exp(-hopSec / (this.gainAttackMs / 1000));
+    this.gainRelease = 1 - Math.exp(-hopSec / (this.gainReleaseMs / 1000));
     this.lambda = coherenceLambda;
     this.oneMinusLambda = 1 - coherenceLambda;
 
@@ -170,6 +186,8 @@ export class SpectralSubtractor {
     this.magProd = new Float32Array(this.bins);
     this.coherence = new Float32Array(this.bins);
     this.gain = new Float32Array(this.bins);
+    this.sGain = new Float32Array(this.bins);
+    this.sGain.fill(1);
     this.pSmooth = new Float32Array(this.bins);
     this.cleanPow = new Float32Array(this.bins);
     this.gain.fill(1);
@@ -199,6 +217,14 @@ export class SpectralSubtractor {
     if (params.noiseBiasDb !== undefined && Number.isFinite(params.noiseBiasDb)) {
       const db = Math.max(0, Math.min(20, params.noiseBiasDb));
       this.noiseBias = Math.pow(10, db / 20);
+    }
+    if (params.gainAttackMs !== undefined && Number.isFinite(params.gainAttackMs)) {
+      this.gainAttackMs = Math.max(1, Math.min(100, params.gainAttackMs));
+      this.gainAttack = 1 - Math.exp(-(this.H / this.sampleRate) / (this.gainAttackMs / 1000));
+    }
+    if (params.gainReleaseMs !== undefined && Number.isFinite(params.gainReleaseMs)) {
+      this.gainReleaseMs = Math.max(20, Math.min(2000, params.gainReleaseMs));
+      this.gainRelease = 1 - Math.exp(-(this.H / this.sampleRate) / (this.gainReleaseMs / 1000));
     }
   }
 
@@ -584,9 +610,32 @@ export class SpectralSubtractor {
       cleanPow[k] = power[k];
     }
 
-    // Apply gains; mirror onto the negative-frequency bins.
+    // Asymmetric gain smoothing: open fast, close slowly. Bypass snaps to
+    // unity (toggle-off stays bit-exact); bin 0 is pinned to 1 so DC
+    // reconstruction stays exact. cleanPow tracks the APPLIED gain so the
+    // DD recursion sees what the ear gets.
+    const sGain = this.sGain;
+    if (bypass) {
+      sGain.fill(1);
+    } else {
+      const atk = this.gainAttack;
+      const rel = this.gainRelease;
+      sGain[0] = 1;
+      for (let k = 1; k <= this.maxBin; k++) {
+        const g = gain[k];
+        const s = sGain[k];
+        sGain[k] = s + (g - s) * (g > s ? atk : rel);
+      }
+    }
+
+    // Apply gains; mirror onto the negative-frequency bins. cleanPow is
+    // deliberately NOT updated here: it tracks the instantaneous
+    // (pre-smoothing) gain so the DD recursion keeps its fast dynamics --
+    // feeding it the smoothed gain built a feedback loop (open gains ->
+    // high cleanPow -> high xi -> open gains) that cost 12 dB of steady
+    // cut. Estimate fast, apply smooth.
     for (let k = 0; k <= this.maxBin; k++) {
-      const g = gain[k];
+      const g = bypass ? 1 : sGain[k];
       frameRe[k] *= g;
       frameIm[k] *= g;
       if (k > 0 && k < N - k) {
