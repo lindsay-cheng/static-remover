@@ -47,6 +47,10 @@ export class SpectralSubtractor {
       coherenceLambda = 0.9,
       tripRatio = 4,
       tripFrames = 25,
+      restEnterFrac = 0.85,
+      restExitFrac = 0.7,
+      restEnterFrames = 32,
+      restExtraDb = 10,
     } = options;
 
     if (hopSize !== frameSize / 2) {
@@ -100,6 +104,16 @@ export class SpectralSubtractor {
     this.tonalityGate = tonalityGate;
     this.tripRatio = tripRatio;
     this.tripFrames = tripFrames;
+    // Rest regime: confirmed silence gets a floor restExtraDb deeper than
+    // the music floor (default -25 dB), since there is nothing to protect.
+    // Tracks the strength slider via maxSuppressionDb (recomputed in
+    // setParams); clamped so aggressive settings cannot gate to digital
+    // zero (a -40 dB bed stays inaudible without sounding dead).
+    this.restEnterFrac = restEnterFrac;
+    this.restExitFrac = restExitFrac;
+    this.restEnterFrames = restEnterFrames;
+    this.restExtraDb = restExtraDb;
+    this.restFloor = Math.pow(10, -Math.min(40, maxSuppressionDb + restExtraDb) / 20);
     this.lambda = coherenceLambda;
     this.oneMinusLambda = 1 - coherenceLambda;
 
@@ -138,6 +152,8 @@ export class SpectralSubtractor {
     this.updateFlag = new Uint8Array(this.bins);
     this.tripCount = new Uint16Array(this.bins);
     this.starve = new Uint16Array(this.bins);
+    this.restCount = 0;
+    this.restActive = false;
     this.initDone = false;
 
     // Per-bin spectrum state.
@@ -176,6 +192,7 @@ export class SpectralSubtractor {
       this.gFloor = Math.pow(10, -db / 20);
       this.maxSuppressionDb = db;
       this.hiFloor = Math.pow(10, -Math.max(0, db - 7) / 20);
+      this.restFloor = Math.pow(10, -Math.min(40, db + this.restExtraDb) / 20);
       const sDb = Math.max(1, db);
       this.toneCapDiv = Math.max(1, Math.min(32, Math.round(8 * (15 / sDb) * (15 / sDb))));
     }
@@ -411,6 +428,41 @@ export class SpectralSubtractor {
     const DD_ALPHA = 0.98;
     const XI_MIN = 0.0031622776601683794; // -25 dB
     const XI_MAX = 1000;
+    // Rest regime (two-regime sweet spot): confirmed silence gets the deep
+    // rest floor, since there is no music to protect. The detector is
+    // relative to our own floor estimate (self-calibrating across playback
+    // levels and YouTube DRC): fraction of bins sitting within 6 dB of
+    // estimated noise. Entry needs ~0.7 s consecutive (tails and ticks
+    // delay it -- safe direction); exit is instant with a hysteresis band
+    // against boundary flapping. On exit, reseed DD clean-power from current
+    // evidence so soft entrances are not dulled by stale-low memory (same
+    // philosophy as the cutoff snap).
+    let nearFloor = 0;
+    for (let k = 1; k <= this.maxBin; k++) {
+      if (power[k] < noise[k] * 4) nearFloor++;
+    }
+    // No peak veto: sparse soft notes share the peak-to-mean signature of
+    // loud tones (measured 60-500 in real pauses vs 501 synth tone), so no
+    // threshold separates them -- and none is needed. The tonal cap stays
+    // ACTIVE in rests, so sparse partials keep their +9 dB SNR protection
+    // while the wash between them goes to the deep floor. Dense music fails
+    // the fraction first, so rests are the only regime affected.
+    const restFrac = nearFloor / this.maxBin;
+    if (this.restActive) {
+      if (restFrac < this.restExitFrac) {
+        this.restActive = false;
+        this.restCount = 0;
+        for (let k = 0; k <= this.maxBin; k++) cleanPow[k] = power[k];
+      }
+    } else if (restFrac > this.restEnterFrac) {
+      if (++this.restCount >= this.restEnterFrames) {
+        this.restActive = true;
+      }
+    } else {
+      this.restCount = 0;
+    }
+    const rest = this.restActive;
+    const restFloor = this.restFloor;
 
     for (let k = 0; k <= this.maxBin; k++) {
       if (bypass) {
@@ -438,6 +490,9 @@ export class SpectralSubtractor {
       // bin misread as tonal is only mildly under-suppressed for a frame,
       // never passed through.
       let n = noiseS[k] + 1e-20;
+      // Tonal cap stays active in rests (it is what lets sparse pause-notes
+      // through); the deep floor + relaxed air cap do the extra work on the
+      // wash between partials.
       if (coherence[k] >= gateT) {
         const cap = power[k] / this.toneCapDiv + 1e-20;
         if (n > cap) n = cap;
@@ -460,7 +515,7 @@ export class SpectralSubtractor {
       // to it (k = 0.03, ~0.7 dB lift at most). Removes the hard edge that
       // turns near-floor bins into on/off gates.
       const gRaw = stsGain(xi, gamma, 0);
-      const fl = k >= this.hiK ? Math.max(liftedFloor, this.hiFloor) : liftedFloor;
+      const fl = rest ? restFloor : (k >= this.hiK ? Math.max(liftedFloor, this.hiFloor) : liftedFloor);
       const dknee = 0.03;
       gain[k] = 0.5 * (gRaw + fl + Math.sqrt((gRaw - fl) * (gRaw - fl) + dknee * dknee));
       cleanPow[k] = gain[k] * gain[k] * power[k];
@@ -518,8 +573,9 @@ export class SpectralSubtractor {
         gain[k + 1] < 0.15 &&
         gain[k + 2] < 0.15
       ) {
-        gain[k] = liftedFloor;
-        cleanPow[k] = liftedFloor * liftedFloor * power[k];
+        const repairFloor = rest ? restFloor : liftedFloor;
+        gain[k] = repairFloor;
+        cleanPow[k] = repairFloor * repairFloor * power[k];
       }
     }
     gain[0] = 1;
