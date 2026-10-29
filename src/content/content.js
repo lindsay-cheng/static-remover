@@ -33,6 +33,9 @@
   // failure: the badge shows "…" and the observer retries automatically.
   let pendingIntent = false;
   let lastAttempt = 0;
+  // problemSent: re-hook failures report once (badge ?) until recovery, so
+  // SPA re-hooks don't spam the service worker every mutation.
+  let problemSent = false;
 
   function findVideo() {
     return (
@@ -244,7 +247,16 @@
         currentVideo = null;
         currentSource = null;
       }
-      hookVideo();
+      const r = hookVideo();
+      if (enabled && r && r !== 'no-video' && findVideo()) {
+        // Element exists but is unusable (e.g. owned): report once.
+        if (!problemSent) {
+          problemSent = true;
+          chrome.runtime.sendMessage({ type: 'problem', reason: r }).catch(() => {});
+        }
+      } else {
+        problemSent = false;
+      }
     });
   }
 

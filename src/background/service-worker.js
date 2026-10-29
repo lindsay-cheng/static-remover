@@ -17,7 +17,11 @@ const PENDING_TITLES = {
 };
 
 async function setPendingBadge(tabId, reason) {
-  await chrome.action.setBadgeText({ tabId, text: '…' });
+  // needs-gesture shows "press play": the only pending state the user must
+  // act on themselves (toolbar clicks are not page gestures). Everything
+  // else resolves by itself, hence "…".
+  const text = reason === 'needs-gesture' ? '▶' : '…';
+  await chrome.action.setBadgeText({ tabId, text });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#808080' });
   await chrome.action.setTitle({
     tabId,
@@ -102,11 +106,25 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (msg?.type === 'state' && sender.tab?.id != null) {
+  if (sender.tab?.id == null) return;
+  if (msg?.type === 'problem') {
+    showProblem(sender.tab.id, msg?.reason);
+    return;
+  }
+  if (msg?.type === 'state') {
     if (msg.pending && !msg.enabled) {
       setPendingBadge(sender.tab.id);
     } else {
       setBadge(sender.tab.id, !!msg.enabled);
     }
+  }
+});
+
+// Full navigation replaces the content script (fresh disabled state); clear
+// any stale ON badge before the new script announces itself.
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status === 'loading') {
+    chrome.action.setBadgeText({ tabId, text: '' });
+    chrome.action.setTitle({ tabId, title: 'Toggle static removal' });
   }
 });
