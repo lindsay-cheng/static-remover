@@ -11,6 +11,3 @@ One toolbar click cleans a noisy recording; off until toggled, per tab.
 Run the tuning harness:
 
     bash harness/run-samples.sh
-
-Design decisions, measurements, and slices: see `../docs/plan.md` (kept outside
-this repo on purpose).
