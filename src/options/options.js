@@ -1,7 +1,7 @@
 // Plain options page: native controls, persisted to chrome.storage.sync,
 // picked up live by the content script. Debounced writes (sync quota).
 
-const DEFAULTS = { alpha: 2, maxSuppressionDb: 18 };
+const DEFAULTS = { alpha: 1.0, maxSuppressionDb: 12 };
 const alpha = document.getElementById('alpha');
 const floor = document.getElementById('floor');
 const alphaOut = document.getElementById('alphaOut');

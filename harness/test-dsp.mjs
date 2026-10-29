@@ -101,15 +101,29 @@ function check(label, ok, detail) {
 }
 
 // 3. Noise floor must drop clearly (measured in the processed band, after the
-//    estimator has converged). Noise-only input: the metric is band energy.
+//    estimator has converged). Two pinned configs: the shipping default must
+//    give an audible cut, and the strong reference config must show the
+//    engine's full headroom (guards against estimator regressions, which
+//    historically measured 2-4 dB).
 {
   const n = sr * 12;
   const sig = new Float32Array(n);
   for (let i = 0; i < n; i++) sig[i] = 0.03 * (Math.random() * 2 - 1);
-  const out = run(sig, opts);
+  const outDefault = run(sig, opts);
+  const outStrong = run(sig, { alpha: 2, noiseBiasDb: 9, maxSuppressionDb: 18 });
   const before = bandDb(sig, sr * 5, n, 600, 1400);
-  const after = bandDb(out, sr * 5, n, 600, 1400);
-  check('noise floor suppressed by >= 8 dB (600-1400 Hz)', before - after >= 8, `${(before - after).toFixed(2)} dB reduction`);
+  const afterDefault = bandDb(outDefault, sr * 5, n, 600, 1400);
+  const afterStrong = bandDb(outStrong, sr * 5, n, 600, 1400);
+  check(
+    'default config gives an audible cut (>= 4 dB, 600-1400 Hz)',
+    before - afterDefault >= 4,
+    `${(before - afterDefault).toFixed(2)} dB reduction`,
+  );
+  check(
+    'strong reference config keeps full headroom (>= 12 dB, 600-1400 Hz)',
+    before - afterStrong >= 12,
+    `${(before - afterStrong).toFixed(2)} dB reduction`,
+  );
 }
 
 // 4. Decaying piano-like notes must not lose level. The noise floor runs for

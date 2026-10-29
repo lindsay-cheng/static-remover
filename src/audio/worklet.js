@@ -14,9 +14,9 @@ class StaticRemoverProcessor extends AudioWorkletProcessor {
     const o = (options && options.processorOptions) || {};
     this.frameSize = o.frameSize || 2048;
     this.settings = {
-      alpha: o.alpha ?? 2,
-      maxSuppressionDb: o.maxSuppressionDb ?? 18,
-      noiseBiasDb: o.noiseBiasDb ?? 9,
+      alpha: o.alpha ?? 1.0,
+      maxSuppressionDb: o.maxSuppressionDb ?? 12,
+      noiseBiasDb: o.noiseBiasDb ?? 3,
     };
     this.enabled = false;
     this.errorSent = false;
