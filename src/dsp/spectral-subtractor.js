@@ -222,11 +222,16 @@ export class SpectralSubtractor {
     // Power spectrum, smoothed spectrum, and frame-to-frame phase coherence.
     // Coherence ~1 => tonal (a tone's phase advances constantly), ~0 => noise.
     // CUTOFF SNAP: histories (coherence averages, DD clean power) are trailed
-    // by loud past energy -- after a 12 dB+ single-frame drop they would
-    // claim "tone" for seconds (measured: stuck gains for 4+ s after a
-    // cutoff). A sharp drop means the past no longer describes the present,
-    // so restart all history from current evidence. Gradual decays (piano
-    // dampers, hall tails) never drop this fast and are unaffected.
+    // by loud past energy -- after a cutoff they would claim "tone" for
+    // seconds (measured: stuck gains for 4+ s, then only ~-4 dB cleaning
+    // indefinitely). Fires on (a) 12 dB+ single-frame drops, or (b) power
+    // collapsing relative to the DD's clean-power memory (musical cutoffs
+    // that complete over 2-5 frames -- too gradual for (a); cleanPow trails
+    // loud past by ~50+ frames, so the ratio stays tripped only until the
+    // reset lands, then self-terminates). A sharp drop means the past no
+    // longer describes the present, so restart all history from current
+    // evidence. Gradual decays (piano dampers, hall tails) never drop this
+    // fast and are unaffected.
     const lambda = this.lambda;
     const oneMinusLambda = this.oneMinusLambda;
     let totalPower = 0;
@@ -239,7 +244,10 @@ export class SpectralSubtractor {
       pSmooth[k] = 0.5 * pSmooth[k] + 0.5 * p; // 2-frame periodogram average
       smoothed[k] = this.beta * smoothed[k] + this.oneMinusBeta * p;
 
-      if (p < smoothed[k] * 0.0625 && smoothed[k] > 1e-8) {
+      if (
+        (p < smoothed[k] * 0.0625 && smoothed[k] > 1e-8) ||
+        (cleanPow[k] > 1e-9 && p < cleanPow[k] * 0.0625)
+      ) {
         // Restart HISTORY from current evidence (coherence averages, DD
         // clean power, tripwire) so stale loud past stops claiming "tone".
         // Deliberately does NOT touch est/slowMin/noise: floor estimation
@@ -439,11 +447,22 @@ export class SpectralSubtractor {
       if (gamma < 1e-6) gamma = 1e-6;
       else if (gamma > 1e4) gamma = 1e4;
 
+      // Decision-directed a priori SNR (Ephraim-Malah eq. 51, fixed 0.98).
+      // Deliberately NOT SNR-dependent: an iZotope-style alpha that trusts
+      // the frame at high gamma cost 2.5 dB of steady-hiss cut while buying
+      // nothing measurable (attacks already pass via gamma-dominance: at
+      // high gamma G->1 for any xi, suite attacks read 0.0 ms either way).
       let xi = DD_ALPHA * (cleanPow[k] / n) + (1 - DD_ALPHA) * (gamma > 1 ? gamma - 1 : 0);
       if (xi < XI_MIN) xi = XI_MIN;
       else if (xi > XI_MAX) xi = XI_MAX;
 
-      gain[k] = stsGain(xi, gamma, k >= this.hiK ? Math.max(liftedFloor, this.hiFloor) : liftedFloor);
+      // Soft-knee floor (Acon-style): round the clamp instead of snapping
+      // to it (k = 0.03, ~0.7 dB lift at most). Removes the hard edge that
+      // turns near-floor bins into on/off gates.
+      const gRaw = stsGain(xi, gamma, 0);
+      const fl = k >= this.hiK ? Math.max(liftedFloor, this.hiFloor) : liftedFloor;
+      const dknee = 0.03;
+      gain[k] = 0.5 * (gRaw + fl + Math.sqrt((gRaw - fl) * (gRaw - fl) + dknee * dknee));
       cleanPow[k] = gain[k] * gain[k] * power[k];
     }
     // Masking-aware lift (iZotope-style): where the residual hiss sits far
