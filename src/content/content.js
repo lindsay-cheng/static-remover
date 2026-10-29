@@ -1,12 +1,16 @@
 // Isolated-world content script. Owns the AudioContext, the one-shot
 // MediaElementSource, the worklet node, video discovery / SPA re-hook,
-// settings, and the fail-safe. Toggle-off is alpha=0 in-graph (the DSP is a
-// bit-exact delay line at alpha 0); the graph is never disconnected and the
-// context is never closed, because both can permanently silence the element.
+// settings, and the fail-safe. Toggle-off is bypass in-graph (the DSP is a
+// bit-exact delay line when bypassed); the graph is never disconnected and
+// the context is never closed, because both can permanently silence the
+// element.
 
 (() => {
   if (globalThis.__staticRemover) return;
   globalThis.__staticRemover = true;
+  // Presence of this line in the page console proves the current build is
+  // running in the tab (pre-fix builds logged nothing on injection).
+  console.log('[static-remover] content script injected');
 
   const DEFAULTS = { maxSuppressionDb: 15, noiseBiasDb: 9 };
   const FRAME = 2048;
