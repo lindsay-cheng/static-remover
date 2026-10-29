@@ -9,9 +9,9 @@
 // real cuts by several dB (measured: 1.6 dB vs 6.1 dB on the same files).
 //
 // Expects (produced by accept-samples.sh):
-//   ../out/accept-A.wav       (Rach, quiet static)
-//   ../out/accept-B.wav       (Rach, full mix)
-//   ../out/accept-brahms.wav  (Chopin, quiet theme)
+//   ../audio/outputs/accept-A.wav       (Rach, quiet static)
+//   ../audio/outputs/accept-B.wav       (Rach, full mix)
+//   ../audio/outputs/accept-chopin.wav  (Chopin, quiet theme)
 //
 //   bash harness/accept-samples.sh && node harness/accept.mjs
 
@@ -46,13 +46,13 @@ function check(label, ok, detail) {
 
 // A: Rach quiet static 2-14 s -- must CLEAN.
 {
-  const q = quality(PROJ + '/out/sampleA-in.wav', PROJ + '/out/accept-A.wav', 2, 14);
+  const q = quality(PROJ + '/audio/outputs/sampleA-in.wav', PROJ + '/audio/outputs/accept-A.wav', 2, 14);
   check('Rach quiet: static band cut >= 8 dB', q.static <= -8, `${q.static.toFixed(2)} dB`);
 }
 
 // B: Rach full mix -- must PRESERVE.
 {
-  const q = quality(PROJ + '/out/sampleB-in.wav', PROJ + '/out/accept-B.wav', 0, 0);
+  const q = quality(PROJ + '/audio/outputs/sampleB-in.wav', PROJ + '/audio/outputs/accept-B.wav', 0, 0);
   check('Rach mix: overall change >= -1.5 dB', q.overall >= -1.5, `${q.overall.toFixed(2)} dB`);
   check('Rach mix: high band change >= -2 dB', q.high >= -2, `${q.high.toFixed(2)} dB`);
 }
@@ -60,8 +60,8 @@ function check(label, ok, detail) {
 // Chopin quiet theme 14-20 s -- must CLEAN static while keeping overall close.
 {
   const q = quality(
-    PROJ + '/samples-brahms/brahms-theme.wav',
-    PROJ + '/out/accept-brahms.wav',
+    PROJ + '/audio/inputs/chopin-zimerman-1984/chopin-theme.wav',
+    PROJ + '/audio/outputs/accept-chopin.wav',
     14,
     20,
   );

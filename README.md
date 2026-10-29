@@ -12,5 +12,5 @@ Run the tuning harness:
 
     bash harness/run-samples.sh
 
-Design decisions, measurements, and slices: see `../plan.md` (kept outside
+Design decisions, measurements, and slices: see `../docs/plan.md` (kept outside
 this repo on purpose).

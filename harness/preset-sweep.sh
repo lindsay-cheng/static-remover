@@ -7,7 +7,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="$(cd "$HERE/../.." && pwd)"
-OUT="$PROJ/out"
+OUT="$PROJ/audio/outputs"
 SWEEP="$OUT/sweep"
 mkdir -p "$SWEEP"
 

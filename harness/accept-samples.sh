@@ -7,7 +7,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="$(cd "$HERE/../.." && pwd)"
-OUT="$PROJ/out"
+OUT="$PROJ/audio/outputs"
 
 NODE="$(command -v node || true)"
 if [ -z "$NODE" ]; then
@@ -16,5 +16,5 @@ fi
 
 $NODE "$HERE/denoise-file.mjs" "$OUT/sampleA-in.wav" "$OUT/accept-A.wav"
 $NODE "$HERE/denoise-file.mjs" "$OUT/sampleB-in.wav" "$OUT/accept-B.wav"
-$NODE "$HERE/denoise-file.mjs" "$PROJ/samples-brahms/brahms-theme.wav" "$OUT/accept-brahms.wav"
+$NODE "$HERE/denoise-file.mjs" "$PROJ/audio/inputs/chopin-zimerman-1984/chopin-theme.wav" "$OUT/accept-chopin.wav"
 echo "acceptance wavs ready in $OUT"

@@ -8,8 +8,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="$(cd "$HERE/../.." && pwd)"
-SAMPLES="$PROJ/samples"
-OUT="$PROJ/out"
+SAMPLES="$PROJ/audio/inputs/rach3-bronfman-2004"
+OUT="$PROJ/audio/outputs"
 mkdir -p "$OUT"
 
 NODE="$(command -v node || true)"
