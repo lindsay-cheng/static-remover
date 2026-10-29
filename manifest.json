@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Static Remover",
+  "version": "0.1.0",
+  "description": "Real-time static removal for YouTube audio. Off until toggled.",
+  "minimum_chrome_version": "111",
+  "permissions": ["storage"],
+  "background": { "service_worker": "src/background/service-worker.js" },
+  "action": { "default_title": "Toggle static removal" },
+  "options_ui": { "page": "src/options/options.html", "open_in_tab": true },
+  "commands": {
+    "toggle-static-removal": {
+      "suggested_key": { "default": "Alt+Shift+S", "mac": "Alt+Shift+S" },
+      "description": "Toggle static removal on this tab"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["src/content/content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/audio/worklet.js",
+        "src/dsp/spectral-subtractor.js",
+        "src/dsp/fft.js"
+      ],
+      "matches": ["https://www.youtube.com/*"]
+    }
+  ]
+}

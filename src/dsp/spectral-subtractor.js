@@ -115,8 +115,24 @@ export class SpectralSubtractor {
     this.fifoCount = this.N;
   }
 
-  process(input, output) {
-    const len = input.length;
+  // Scalar-only runtime update for the options page path. Clamps instead of
+  // throwing (the audio thread must never die on untrusted input) and
+  // allocates nothing, so it is safe to call from a worklet message handler.
+  setParams(params = {}) {
+    if (params.alpha !== undefined && Number.isFinite(params.alpha)) {
+      this.alpha = Math.max(0, Math.min(8, params.alpha));
+    }
+    if (params.maxSuppressionDb !== undefined && Number.isFinite(params.maxSuppressionDb)) {
+      const db = Math.max(0, Math.min(40, params.maxSuppressionDb));
+      this.gFloor = Math.pow(10, -db / 20);
+    }
+    if (params.noiseBiasDb !== undefined && Number.isFinite(params.noiseBiasDb)) {
+      const db = Math.max(0, Math.min(20, params.noiseBiasDb));
+      this.noiseBias = Math.pow(10, db / 20);
+    }
+  }
+
+  process(input, output) {    const len = input.length;
     if (output.length !== len) {
       throw new Error('input and output must have the same length');
     }
