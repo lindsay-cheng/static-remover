@@ -10,12 +10,15 @@ async function setBadge(tabId, enabled) {
   }
 }
 
-async function showProblem(tabId) {
+async function showProblem(tabId, reason) {
   await chrome.action.setBadgeText({ tabId, text: '?' });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#cc0000' });
+  const owned = /InvalidStateError|already connected/i.test(reason || '');
   await chrome.action.setTitle({
     tabId,
-    title: 'Static Remover: reload this YouTube tab, then click again',
+    title: owned
+      ? 'Static Remover: reload this YouTube tab, then click again'
+      : `Static Remover: could not hook this video${reason ? ` (${reason})` : ''}`,
   });
 }
 
@@ -40,7 +43,7 @@ async function toggle(tab) {
     const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
     if (res?.ok === false) {
       console.warn('[static-remover] toggle failed:', res?.error);
-      await showProblem(tab.id);
+      await showProblem(tab.id, res?.error);
       return;
     }
     await setBadge(tab.id, !!res?.enabled);
@@ -49,6 +52,10 @@ async function toggle(tab) {
     if (await ensureContentScript(tab.id, tab.url)) {
       try {
         const res = await chrome.tabs.sendMessage(tab.id, { type: 'toggle' });
+        if (res?.ok === false) {
+          await showProblem(tab.id, res?.error);
+          return;
+        }
         await setBadge(tab.id, !!res?.enabled);
         return;
       } catch {}

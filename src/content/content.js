@@ -97,10 +97,14 @@
     return true;
   }
 
+  // Returns null on success, a reason string on failure. An element owned by
+  // a previous (orphaned) graph can never be re-hooked -- only a tab reload
+  // frees it -- so callers must surface the reason, not retry.
   function hookVideo() {
     const v = findVideo();
-    if (!v || blocked.has(v)) return false;
-    if (v === currentVideo && currentSource) return true;
+    if (!v) return 'no-video';
+    if (blocked.has(v)) return 'blocked';
+    if (v === currentVideo && currentSource) return null;
 
     let s = sources.get(v);
     if (!s) {
@@ -108,8 +112,10 @@
         s = ctx.createMediaElementSource(v); // one-shot per element, forever
       } catch (e) {
         blocked.add(v);
-        console.warn('[static-remover] cannot hook video:', e);
-        return false;
+        const reason =
+          (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e));
+        console.warn('[static-remover] cannot hook video:', reason);
+        return reason || 'unknown';
       }
       sources.set(v, s);
     }
@@ -121,30 +127,31 @@
       try {
         s.connect(ctx.destination);
       } catch {}
-      return false;
+      return 'connect-failed';
     }
     currentVideo = v;
     currentSource = s;
-    return true;
+    return null;
   }
 
   async function enable() {
-    if (busy) return false;
+    if (busy) return { ok: false, reason: 'busy' };
     busy = true;
     try {
       if (!(await ensureContext())) {
         armGesture();
-        return false;
+        return { ok: false, reason: 'needs-gesture' };
       }
       await ensureWorklet();
-      if (!hookVideo()) return false;
+      const reason = hookVideo();
+      if (reason) return { ok: false, reason };
       node.port.postMessage({ type: 'enabled', value: true, ...settings });
       enabled = true;
       sendState();
-      return true;
+      return { ok: true };
     } catch (e) {
       console.warn('[static-remover] enable failed:', e);
-      return false;
+      return { ok: false, reason: String((e && e.message) || e) };
     } finally {
       busy = false;
     }
@@ -177,8 +184,13 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (msg?.type !== 'toggle') return;
-    (enabled ? Promise.resolve(disable()) : enable())
-      .then((ok) => reply({ enabled, ok }))
+    if (enabled) {
+      disable();
+      reply({ enabled, ok: true });
+      return;
+    }
+    enable()
+      .then((r) => reply({ enabled, ok: r.ok, error: r.reason }))
       .catch((e) => reply({ enabled, ok: false, error: String(e) }));
     return true; // async reply
   });
